@@ -504,6 +504,34 @@ fn strictify_schema(schema: &mut Value) {
         }
     }
 
+    // The validator also demands a `type` key on EVERY schema node — including
+    // the variants of a `["object","null"]` union it walks one by one (live
+    // case 18.08, second round: tree_note carried `"scope": {}`, an "anything
+    // goes" node, and the whole 98-tool request 400ed on it).  Object nodes get
+    // their type in the block below; every other shapeless node gets one
+    // synthesized here.
+    let has_shape = obj.contains_key("type")
+        || obj.contains_key("anyOf")
+        || obj.contains_key("oneOf")
+        || obj.contains_key("allOf")
+        || obj.contains_key("$ref")
+        || obj.contains_key("properties");
+    if !has_shape {
+        if obj.contains_key("items") || obj.contains_key("prefixItems") {
+            obj.insert("type".to_string(), json!("array"));
+        } else if let Some(members) = obj.get("enum").and_then(Value::as_array) {
+            let inferred = infer_enum_type(members);
+            obj.insert("type".to_string(), inferred);
+        } else if let Some(value) = obj.get("const") {
+            obj.insert("type".to_string(), json!(json_type_name(value)));
+        } else {
+            // A bare `{}` means "any JSON"; the strict subset cannot say that.
+            // "string" is the least restrictive type every validator accepts,
+            // and structured data still travels through it as JSON text.
+            obj.insert("type".to_string(), json!("string"));
+        }
+    }
+
     let declares_object = match obj.get("type") {
         Some(Value::String(t)) => t == "object",
         Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
@@ -544,6 +572,35 @@ fn strictify_schema(schema: &mut Value) {
     obj.insert("additionalProperties".to_string(), json!(false));
     if !obj.contains_key("type") {
         obj.insert("type".to_string(), json!("object"));
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// An enum without a declared `type` gets one inferred from its members, so
+/// the "every node carries a type" rule holds without changing what the enum
+/// already allowed.
+fn infer_enum_type(members: &[Value]) -> Value {
+    let mut names: Vec<&'static str> = Vec::new();
+    for member in members {
+        let name = json_type_name(member);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    match names.len() {
+        0 => json!("string"),
+        1 => json!(names[0]),
+        _ => json!(names),
     }
 }
 
@@ -1688,6 +1745,67 @@ mod tests {
         assert_eq!(item["required"], json!(["path"]));
         assert_eq!(item["properties"]["path"]["type"], json!("string"));
         assert_eq!(mapped[0]["strict"], json!(true));
+    }
+
+    /// ЖИВОЙ СЛУЧАЙ 18.08, второй заход: `tree_note` Уробороса нёс `"scope": {}`
+    /// внутри опционального payload — узел без `type`.  Валидатор бэкенда требует
+    /// `type` на КАЖДОМ узле и проверяет варианты `["object","null"]` поштучно
+    /// (контекст ошибки был `('properties','payload','type','0',…,'scope')`).
+    #[test]
+    fn untyped_nodes_get_a_synthesized_type() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function",
+            "function": {
+                "name": "tree_note",
+                "parameters": {"type": "object", "required": ["kind", "text"], "properties": {
+                    "kind": {"type": "string", "enum": ["contract", "decision"]},
+                    "text": {"type": "string"},
+                    "needs_parent_attention": {"type": "boolean", "default": false},
+                    "payload": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["child_result_disposition"]},
+                            "scope": {},
+                            "bare_enum": {"enum": ["a", "b"]},
+                            "bare_list": {"items": {"type": "string"}}
+                        }
+                    }
+                }}
+            }
+        }]))
+        .unwrap();
+
+        let mapped = map_tools_for_responses(&tools);
+        let payload = &mapped[0]["parameters"]["properties"]["payload"];
+
+        // Optional object stays an object, just nullable.
+        assert_eq!(payload["type"], json!(["object", "null"]));
+        assert_eq!(payload["additionalProperties"], json!(false));
+        // The "anything goes" node got a real type; optional -> nullable.
+        assert_eq!(
+            payload["properties"]["scope"]["type"],
+            json!(["string", "null"])
+        );
+        // Enum without type: inferred from members, then nullable with the enum.
+        assert_eq!(
+            payload["properties"]["bare_enum"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(payload["properties"]["bare_enum"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(Value::is_null));
+        // items without type: it is an array.
+        assert_eq!(
+            payload["properties"]["bare_list"]["type"],
+            json!(["array", "null"])
+        );
+        // The property literally NAMED "type" is data, not structure.
+        assert_eq!(
+            payload["properties"]["type"]["type"],
+            json!(["string", "null"])
+        );
     }
 
     /// Явный strict:false от клиента — осознанный выбор, схему не трогаем.
