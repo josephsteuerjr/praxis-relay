@@ -37,6 +37,23 @@ use it with your own subscription at your own risk.
 The API key presented by clients is ignored; any placeholder string works. Authentication
 towards the backend is the relay's own OAuth store.
 
+### Local-model contract
+
+The relay can stand in for a llama.cpp-style localhost server, so agent frameworks with a
+"local model" lane (e.g. Ouroboros) can point that lane at a subscription instead:
+
+- `/v1/models` entries carry the context window under every field name common localhost
+  clients read: `meta.n_ctx_train` (llama-cpp-python convention), `context_window`, and
+  `context_length` (LM Studio/OpenRouter convention). Clients that size their history by
+  asking the endpoint no longer see 0.
+- The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
+  which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
+  still a strict-list 404, so typos in real model names keep failing loudly.
+- Requests without `"stream": true` get a single aggregated JSON response.
+
+The Ollama-native protocol (`/api/tags`, `/api/chat`) is not spoken; use a framework's
+OpenAI-compatible mode.
+
 ## Run locally
 
 Install a current Rust toolchain, then:
@@ -66,6 +83,9 @@ Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is uns
 ### Configuration (environment variables)
 
 - `RELAY_PORT` — listen port, default `5011` (always loopback-only).
+- `RELAY_DEFAULT_MODEL` — what the `local-model` alias resolves to, default `gpt-5.4`.
+- `RELAY_CONTEXT_LENGTH` — context window advertised in `/v1/models`, default `400000`
+  (advisory metadata for clients; the real limit is enforced upstream).
 - `RELAY_AUTH_DIR` — credential directory, default `local_auth` next to the executable.
 - `RELAY_PYTHON` — explicit Python 3 interpreter for the login helper.
 - `RELAY_REASONING_EFFORT` — default reasoning effort applied when a request carries none

@@ -26,10 +26,20 @@ impl Config {
         let instructions_mode = Self::load_instructions_mode();
         let parallel_tool_calls = Self::load_parallel_tool_calls();
 
+        // RELAY_DEFAULT_MODEL: what the "local-model" alias resolves to (clients
+        // built against llama-cpp-python hardcode that slug).  Kept at the safest
+        // slug by default; an unsupported override fails loudly at request time
+        // with the 404 that names the real list.
+        let model = std::env::var("RELAY_DEFAULT_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "gpt-5.4".to_string());
+
         Ok(Config {
             codex_home,
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            model: "gpt-5.4".to_string(), // Default, but can be changed to any gpt-5* variant
+            model,
             user_instructions,
             reasoning_effort,
             instructions_mode,

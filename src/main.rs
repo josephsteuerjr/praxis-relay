@@ -718,7 +718,7 @@ async fn chat_completions_handler(
     _headers: HeaderMap,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, StatusCode> {
-    let request = match payload {
+    let mut request = match payload {
         Ok(Json(request)) => request,
         Err(rejection) => {
             let status = rejection.status();
@@ -741,6 +741,19 @@ async fn chat_completions_handler(
                 .into_response());
         }
     };
+
+    // llama.cpp-style clients (Ouroboros's local lane among them) hardcode the
+    // slug "local-model" because llama-cpp-python ignores the field.  Map that
+    // one literal onto the relay default BEFORE validation; every other unknown
+    // name stays a strict-list 404 so real typos keep failing loudly.
+    if request.model == core::models::LOCAL_MODEL_ALIAS {
+        info!(
+            "model alias: {} -> {}",
+            core::models::LOCAL_MODEL_ALIAS,
+            state.config.model
+        );
+        request.model = state.config.model.clone();
+    }
 
     info!("🚀 CHAT COMPLETIONS REQUEST RECEIVED!");
     info!(

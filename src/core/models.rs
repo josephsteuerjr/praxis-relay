@@ -45,10 +45,45 @@ pub fn is_supported_model(model: &str) -> bool {
     SUPPORTED_MODELS.contains(&model)
 }
 
+/// The model slug that llama.cpp-style clients hardcode.  llama-cpp-python
+/// ignores the request's model field entirely, so frameworks built against it
+/// (Ouroboros's local lane among them: `llm.py` sends `"model": "local-model"`
+/// on every call) never made the name configurable.  The relay maps this one
+/// literal onto its default model instead of 404ing every call from such a
+/// client.  Only this exact string — anything else stays a strict-list reject,
+/// so typos in real model names still fail loudly.
+pub const LOCAL_MODEL_ALIAS: &str = "local-model";
+
+/// Advertised context window, in tokens.  Advisory metadata for clients that
+/// size their history by asking the endpoint (Ouroboros reads
+/// `meta.n_ctx_train`, then `context_window`, and treats 0 as "tiny model":
+/// output capped and history compacted to fit ~4k).  The real limit is
+/// enforced upstream per model and plan; RELAY_CONTEXT_LENGTH overrides the
+/// advertised number if it proves wrong for a given account.
+pub const DEFAULT_ADVERTISED_CONTEXT_LENGTH: u32 = 400_000;
+
+/// Advertised output ceiling, advisory in the same way.
+pub const DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS: u32 = 128_000;
+
+pub fn advertised_context_length() -> u32 {
+    std::env::var("RELAY_CONTEXT_LENGTH")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ADVERTISED_CONTEXT_LENGTH)
+}
+
 /// Build the `/v1/models` payload from [`SUPPORTED_MODELS`] so the advertised
 /// list is generated from the same constant the request validator checks against.
+///
+/// Each entry carries the context window under every field name the common
+/// localhost clients actually read: `meta.n_ctx_train` (llama-cpp-python — the
+/// primary key Ouroboros checks), `context_window` (its fallback), and
+/// `context_length` (LM Studio/OpenRouter convention).  Plain OpenAI clients
+/// ignore unknown fields, so the extras cost nothing.
 pub fn supported_model_list() -> ModelList {
     let created = chrono::Utc::now().timestamp();
+    let context_length = advertised_context_length();
     ModelList {
         object: "list".to_string(),
         data: SUPPORTED_MODELS
@@ -58,6 +93,12 @@ pub fn supported_model_list() -> ModelList {
                 object: "model".to_string(),
                 created,
                 owned_by: "chatgpt".to_string(),
+                context_window: context_length,
+                context_length,
+                max_output_tokens: DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS,
+                meta: ModelMeta {
+                    n_ctx_train: context_length,
+                },
             })
             .collect(),
     }
@@ -470,6 +511,17 @@ pub struct Model {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    // Advisory context metadata under every field name common localhost
+    // clients read; see supported_model_list() for who reads what.
+    pub context_window: u32,
+    pub context_length: u32,
+    pub max_output_tokens: u32,
+    pub meta: ModelMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMeta {
+    pub n_ctx_train: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +648,13 @@ mod tests {
         for m in &list.data {
             assert_eq!(m.object, "model");
             assert_eq!(m.owned_by, "chatgpt");
+            // The Ouroboros local lane reads meta.n_ctx_train (then
+            // context_window) and treats 0 as a tiny model: output capped,
+            // history compacted to nothing.  Never advertise 0.
+            assert!(m.meta.n_ctx_train > 0);
+            assert_eq!(m.context_window, m.meta.n_ctx_train);
+            assert_eq!(m.context_length, m.meta.n_ctx_train);
+            assert!(m.max_output_tokens > 0);
         }
     }
 
