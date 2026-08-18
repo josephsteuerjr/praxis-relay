@@ -1,81 +1,43 @@
-# Praxis Relay for Windows
+# Praxis Relay
 
-`relay` is a standalone Rust/Axum service that exposes a small OpenAI-compatible API on
-`127.0.0.1:5011`, backed by a ChatGPT subscription (Plus/Pro) instead of API billing.
+One small binary that turns a **ChatGPT subscription** (Plus/Pro) into a **local
+OpenAI-compatible LLM API** — a frontier-model brain for any agent framework, at a flat
+subscription price.
 
-This Windows-focused edition tracks the production relay used by the Praxis deployment
-(`/opt/relay/Code`, synced at revision `84e6911`) and adds on top of it: a native Windows
-build, Windows-aware Python discovery for the login flow, a relay-owned OAuth store that
-stays isolated from the user's normal Codex credentials, non-streaming responses, and
-route aliases for picky OpenAI clients. A quick-start guide in Russian lives in
-[ПАМЯТКА.md](ПАМЯТКА.md).
+Point your agent at `http://127.0.0.1:5011/v1` with any placeholder string as the API key,
+and it talks to the GPT-5.6 family with tool calling, vision input, streaming, and real
+usage accounting. No OpenAI API account, no per-token billing, no key to leak. The relay
+signs into your own ChatGPT account once and speaks the Codex protocol to the backend on
+your behalf.
 
-## Upstream and license
+Русская памятка по запуску — [ПАМЯТКА.md](ПАМЯТКА.md).
 
-This project is derived from
-[unluckyjori/Codex-Proxy-Server](https://github.com/unluckyjori/Codex-Proxy-Server)
-at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`.
-The original project and this derivative are distributed under the MIT License. The original
-copyright and permission notice are preserved in [LICENSE](LICENSE).
+## Why it is more than a proxy
 
-This project is independently maintained and is not affiliated with or endorsed by OpenAI.
-It speaks the Codex protocol to the ChatGPT backend; treat it as an unofficial bridge and
-use it with your own subscription at your own risk.
+- **It meets clients where they are.** Chat Completions answers with and without the `/v1`
+  prefix; `"stream": true` gets SSE, everything else gets one aggregated JSON response.
+  And it impersonates a llama.cpp-style "local model" server well enough that frameworks
+  with a local-llama lane plug in unmodified: the context window is advertised under every
+  field name such clients read (`meta.n_ctx_train`, `context_window`, `context_length`),
+  and the `local-model` slug those clients hardcode resolves to a configurable real model.
+- **Arbitrary tool schemas survive the strict backend.** The subscription backend validates
+  function schemas against a strict subset — `additionalProperties: false`, an exhaustive
+  `required`, a `type` on every node — that ordinary framework registries and MCP servers
+  do not speak, and one non-conforming function fails the whole request. The relay rewrites
+  every schema on the fly, preserving optionality through nullable types. Proven live on an
+  agent turn carrying 98 tools.
+- **Subscription-grade resilience.** Two account slots with automatic failover when a quota
+  runs out, bounded cooldowns, deliberate switching over the API, token refresh driven by
+  the token's actual expiry, and machine-readable terminal errors that distinguish "quota
+  exhausted" from "credentials dead" from "upstream tore the stream" — so a client can
+  react instead of blindly retrying.
+- **Private by construction.** The server binds to loopback only. Credentials live in one
+  directory next to the binary — never `~/.codex`, never the shell environment — and the
+  API key your client presents is decorative.
 
-## Endpoints
+## Quick start (Windows)
 
-- `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions,
-  streaming (SSE) when the request carries `"stream": true`, a single aggregated
-  `chat.completion` JSON object otherwise. Tool calls and image input are supported.
-- `GET /v1/models` (alias: `GET /models`) — the supported model list
-  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`).
-- `GET /v1/limits` — remaining subscription quota as reported by the backend.
-- `GET /v1/account` / `POST /v1/account/switch` — inspect and deliberately switch
-  the active subscription slot (see multi-account below).
-- `GET /health` — liveness plus the account-router state.
-
-The API key presented by clients is ignored; any placeholder string works. Authentication
-towards the backend is the relay's own OAuth store.
-
-### Local-model contract
-
-The relay can stand in for a llama.cpp-style localhost server, so agent frameworks with a
-"local model" lane (e.g. Ouroboros) can point that lane at a subscription instead:
-
-- `/v1/models` entries carry the context window under every field name common localhost
-  clients read: `meta.n_ctx_train` (llama-cpp-python convention), `context_window`, and
-  `context_length` (LM Studio/OpenRouter convention). Clients that size their history by
-  asking the endpoint no longer see 0.
-- The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
-  which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
-  still a strict-list 404, so typos in real model names keep failing loudly.
-- Requests without `"stream": true` get a single aggregated JSON response.
-- Function tools are sent upstream with `strict: true` (the relay default), and the backend
-  validates their JSON schemas against the strict subset: `additionalProperties: false` plus
-  a full `required` on every object. Ordinary framework/MCP schemas do not conform, and one
-  non-conforming function used to 400 the whole request — so the relay normalizes every
-  schema to the strict subset, preserving optionality by adding `null` to the type (and
-  enum) of properties that were not originally required. A client that explicitly sets
-  `strict: false` on a function gets its schema forwarded untouched.
-
-The Ollama-native protocol (`/api/tags`, `/api/chat`) is not spoken; use a framework's
-OpenAI-compatible mode.
-
-## Run locally
-
-Install a current Rust toolchain, then:
-
-```bash
-cargo run
-```
-
-Choose `3` in the menu to log in, then `1` to start the server. The Dockerfile provides a
-container build for Linux deployments; the process deliberately binds only to loopback, so
-expose it through a separate reverse proxy only when that is an explicit deployment decision.
-
-### Windows
-
-Build and run the native executable from PowerShell:
+Build the native executable (or take a prebuilt `praxis-relay.exe`):
 
 ```powershell
 cargo build --release --locked
@@ -83,11 +45,28 @@ Copy-Item .\target\release\codex-proxy-server.exe .\praxis-relay.exe
 .\praxis-relay.exe
 ```
 
-The server itself does not require Python. Menu option `3` (interactive ChatGPT login) uses
-the first working Python 3 launcher among `python.exe`, `py.exe -3`, and `python3.exe`.
-Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is unsuitable.
+Menu `3` logs the relay into your ChatGPT account (a browser opens; Python 3 is needed only
+for this step — `python.exe`, `py -3`, and `python3.exe` are discovered automatically, or
+set `RELAY_PYTHON`). Menu `1` starts the server. Check `http://127.0.0.1:5011/health`.
 
-### Configuration (environment variables)
+On Linux, `cargo run` behaves the same; the Dockerfile provides a container build. The
+process deliberately binds only to loopback — expose it through a reverse proxy only as an
+explicit deployment decision.
+
+## Endpoints
+
+- `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions,
+  streaming (SSE) when the request carries `"stream": true`, a single aggregated
+  `chat.completion` JSON object otherwise. Tool calls and image input are supported.
+- `GET /v1/models` (alias: `GET /models`) — the supported model list
+  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) with advertised context
+  metadata.
+- `GET /v1/limits` — remaining subscription quota as reported by the backend.
+- `GET /v1/account` / `POST /v1/account/switch` — inspect and deliberately switch the
+  active subscription slot (see multi-account below).
+- `GET /health` — liveness plus the account-router state.
+
+## Configuration (environment variables)
 
 - `RELAY_PORT` — listen port, default `5011` (always loopback-only).
 - `RELAY_DEFAULT_MODEL` — what the `local-model` alias resolves to, default `gpt-5.4`.
@@ -105,8 +84,7 @@ Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is uns
 ## Separate relay authentication
 
 The relay never reads `~/.codex/auth.json` or `~/.opencode/auth.json`. Its credentials live
-only in `local_auth/auth.json` next to the executable (or `RELAY_AUTH_DIR`), matching the
-isolated `/app/local_auth` mount used on the server.
+only in `local_auth/auth.json` next to the executable (or `RELAY_AUTH_DIR`).
 
 On a clean installation, start the executable and choose menu option `3` to authorize the
 relay account, then `1` to serve the API.
@@ -120,8 +98,47 @@ bounded cooldown and switches to the standby; `POST /v1/account/switch {"slot": 
 switches deliberately and clears the cooldown. A single legacy `local_auth/auth.json` keeps
 working as the sole `primary` slot.
 
+## The local-model contract, in detail
+
+The relay can stand in for a llama.cpp-style localhost server, so agent frameworks with a
+"local model" lane can point that lane at a subscription instead:
+
+- `/v1/models` entries carry the context window under every field name common localhost
+  clients read: `meta.n_ctx_train` (llama-cpp-python convention), `context_window`, and
+  `context_length` (LM Studio/OpenRouter convention). Clients that size their history by
+  asking the endpoint no longer see 0.
+- The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
+  which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
+  still a strict-list 404, so typos in real model names keep failing loudly.
+- Requests without `"stream": true` get a single aggregated JSON response.
+- Function tools are sent upstream with `strict: true` (the relay default), and every tool
+  schema is normalized to the strict subset the backend validates: `additionalProperties:
+  false` plus a full `required` on every object, a `type` synthesized for shapeless nodes
+  (a bare `{}` becomes `"string"`; enums infer from their members), with original
+  optionality preserved by adding `null` to the type — and to the enum — of properties that
+  were not originally required. A client that explicitly sets `strict: false` on a function
+  gets its schema forwarded untouched.
+
+The Ollama-native protocol (`/api/tags`, `/api/chat`) is not spoken; use a framework's
+OpenAI-compatible mode.
+
 ## Authentication and privacy
 
 The relay reads authentication only from its dedicated auth directory. Never commit
-`auth.json`, API keys, session files, or relay logs. This public copy contains source code
-and test fixtures only; it deliberately contains no account data.
+`auth.json`, API keys, session files, or relay logs. This repository contains source code
+only; it deliberately contains no account data.
+
+## License and provenance
+
+This project as a whole is distributed under the GNU Affero General Public License v3.0 —
+see [LICENSE](LICENSE).
+
+It is derived from
+[unluckyjori/Codex-Proxy-Server](https://github.com/unluckyjori/Codex-Proxy-Server)
+at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`, which is MIT-licensed.
+The original copyright and permission notice are preserved in [LICENSE.MIT](LICENSE.MIT),
+as the MIT license requires.
+
+This project is independently maintained and is not affiliated with or endorsed by OpenAI.
+It speaks the Codex protocol to the ChatGPT backend; treat it as an unofficial bridge and
+use it with your own subscription at your own risk.

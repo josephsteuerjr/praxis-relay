@@ -1,7 +1,9 @@
 [package]
 name = "codex-proxy-server"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/josephsteuerjr/praxis-relay"
 
 [dependencies]
 # Web server
