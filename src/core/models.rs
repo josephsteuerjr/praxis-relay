@@ -75,6 +75,13 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub tools: Vec<Tool>,
+    // Optional per-request knobs: reasoning depth and upstream cache affinity.
+    // Absent fields fall back to relay-side defaults (RELAY_REASONING_EFFORT env,
+    // derived conversation affinity), so old clients keep byte-identical payloads.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ChatRequest {
@@ -435,11 +442,26 @@ pub struct Choice {
     pub finish_reason: String,
 }
 
+/// Cached prefix accounting, OpenAI-compatible shape.
+///
+/// 02.08.2026. Кэш на этом пути АВТОМАТИЧЕСКИЙ: провайдер сам кэширует совпадающий
+/// префикс, его нельзя «включить» — его зарабатывают стабильностью байтов. Отчитывается
+/// он единственным способом, вот этим полем. Реле схлопывало usage до
+/// `{prompt_tokens, completion_tokens, total_tokens}` и деталь теряло — поэтому у Praxis
+/// в учёте стояли нули по всем ходам через gpt, и это читалось как «кэш не работает».
+/// На самом деле это означало «не сообщено»: отличить одно от другого было нечем.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +478,32 @@ pub struct ModelList {
     pub data: Vec<Model>,
 }
 
+/// Машинное имя того, ЧЕМ кончился ход, — рядом с чанком, а не вместо него.
+///
+/// 11.08.2026. Замер за восемь суток: 81 упавший прогон, 51 из них — один и тот же
+/// `EmptyResponseError`. Внутри этого имени сидели ТРИ разные болезни, и клиент не мог
+/// их различить физически: исчерпанная подписка (лечится часом сброса или другим
+/// слотом), протухшие учётные данные (лечится логином — 10.08 стоило часов немоты) и
+/// порванный апстрим (лечится повтором). Все три уезжали одинаковым чанком
+/// `finish_reason:"error"` с английской прозой в `content`, и на каждый из них клиент
+/// тратил два полных повтора по ~25к токенов и шесть секунд сна — в том числе в
+/// заведомо закрытое шестичасовое окно, где повторять нечего.
+///
+/// Поля необязательные по одной причине: час открытия окна пишется ТОЛЬКО если его
+/// назвал вендор. Выдуманное число хуже отсутствующего — на нём строится план хода.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayTerminal {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_seconds: Option<i64>,
+}
+
 // Response events for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseEvent {
@@ -464,6 +512,14 @@ pub struct ResponseEvent {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ResponseChoice>,
+    // Token accounting from response.completed, forwarded so the client's cost
+    // meter is not blind (reasoning tokens are included in completion_tokens).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage: Option<Usage>,
+    // Терминал — последним полем и со `skip_serializing_if`: пока его нет, байты чанка
+    // совпадают с сегодняшними ровно, и выключенный рычаг ничего не меняет на проводе.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub relay_terminal: Option<RelayTerminal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

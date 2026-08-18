@@ -1,11 +1,14 @@
 # Praxis Relay for Windows
 
 `relay` is a standalone Rust/Axum service that exposes a small OpenAI-compatible API on
-`127.0.0.1:5011` for a local Praxis deployment.
+`127.0.0.1:5011`, backed by a ChatGPT subscription (Plus/Pro) instead of API billing.
 
-This Windows-focused edition adds the Praxis model contract, multimodal input, hosted web
-search mapping, usage-limit reporting, a native Windows build, and a relay-owned OAuth store
-that stays isolated from the user's normal Codex credentials.
+This Windows-focused edition tracks the production relay used by the Praxis deployment
+(`/opt/relay/Code`, synced at revision `84e6911`) and adds on top of it: a native Windows
+build, Windows-aware Python discovery for the login flow, a relay-owned OAuth store that
+stays isolated from the user's normal Codex credentials, non-streaming responses, and
+route aliases for picky OpenAI clients. A quick-start guide in Russian lives in
+[ПАМЯТКА.md](ПАМЯТКА.md).
 
 ## Upstream and license
 
@@ -16,26 +19,35 @@ The original project and this derivative are distributed under the MIT License. 
 copyright and permission notice are preserved in [LICENSE](LICENSE).
 
 This project is independently maintained and is not affiliated with or endorsed by OpenAI.
+It speaks the Codex protocol to the ChatGPT backend; treat it as an unofficial bridge and
+use it with your own subscription at your own risk.
 
-It exposes:
+## Endpoints
 
-- `POST /chat/completions`
-- `GET /v1/models`
-- `GET /v1/limits`
-- `GET /health`
+- `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions,
+  streaming (SSE) when the request carries `"stream": true`, a single aggregated
+  `chat.completion` JSON object otherwise. Tool calls and image input are supported.
+- `GET /v1/models` (alias: `GET /models`) — the supported model list
+  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`).
+- `GET /v1/limits` — remaining subscription quota as reported by the backend.
+- `GET /v1/account` / `POST /v1/account/switch` — inspect and deliberately switch
+  the active subscription slot (see multi-account below).
+- `GET /health` — liveness plus the account-router state.
+
+The API key presented by clients is ignored; any placeholder string works. Authentication
+towards the backend is the relay's own OAuth store.
 
 ## Run locally
 
-Install a current Rust toolchain, then run:
+Install a current Rust toolchain, then:
 
 ```bash
-cd relay
 cargo run
 ```
 
-Choose `1` in the menu to start the server. The Dockerfile provides a container build for
-Linux deployments; the process deliberately binds only to loopback, so expose it through a
-separate reverse proxy only when that is an explicit deployment decision.
+Choose `3` in the menu to log in, then `1` to start the server. The Dockerfile provides a
+container build for Linux deployments; the process deliberately binds only to loopback, so
+expose it through a separate reverse proxy only when that is an explicit deployment decision.
 
 ### Windows
 
@@ -51,15 +63,35 @@ The server itself does not require Python. Menu option `3` (interactive ChatGPT 
 the first working Python 3 launcher among `python.exe`, `py.exe -3`, and `python3.exe`.
 Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is unsuitable.
 
-### Separate relay authentication
+### Configuration (environment variables)
 
-The relay never reads `~/.codex/auth.json`, `~/.opencode/auth.json`, or the generic
-`OPENAI_API_KEY` environment variable. Its credentials live only in `local_auth/auth.json`
-next to the executable, matching the isolated `/app/local_auth` mount used on the server.
+- `RELAY_PORT` — listen port, default `5011` (always loopback-only).
+- `RELAY_AUTH_DIR` — credential directory, default `local_auth` next to the executable.
+- `RELAY_PYTHON` — explicit Python 3 interpreter for the login helper.
+- `RELAY_REASONING_EFFORT` — default reasoning effort applied when a request carries none
+  (`none` by default; requests may override via their own `reasoning_effort` field).
+- `RELAY_INSTRUCTIONS` — `codex` (default) or `minimal` system-instructions mode.
+- `RELAY_PARALLEL_TOOL_CALLS` — `true` (default) or `false`.
+- `RELAY_ACCOUNT_COOLDOWN_SECONDS` — how long an exhausted subscription slot stays parked.
+- `RELAY_LOG_DIR` — log directory, default `logs` under the working directory.
+
+## Separate relay authentication
+
+The relay never reads `~/.codex/auth.json` or `~/.opencode/auth.json`. Its credentials live
+only in `local_auth/auth.json` next to the executable (or `RELAY_AUTH_DIR`), matching the
+isolated `/app/local_auth` mount used on the server.
 
 On a clean installation, start the executable and choose menu option `3` to authorize the
-relay account. Then choose `1` to serve the API. To place credentials elsewhere, set
-`RELAY_AUTH_DIR` to an explicit directory before starting the relay.
+relay account, then `1` to serve the API.
+
+### Multi-account
+
+Two subscription slots with automatic failover are supported: place credentials in
+`local_auth/accounts/primary/auth.json` and `local_auth/accounts/secondary/auth.json`.
+A confirmed quota exhaustion (or a broken active profile) parks the active slot for a
+bounded cooldown and switches to the standby; `POST /v1/account/switch {"slot": "..."}`
+switches deliberately and clears the cooldown. A single legacy `local_auth/auth.json` keeps
+working as the sole `primary` slot.
 
 ## Authentication and privacy
 

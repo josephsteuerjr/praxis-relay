@@ -18,6 +18,7 @@ mod core;
 mod login;
 
 use core::chat_completions;
+use core::account_router::AccountRouter;
 use core::config::Config;
 use core::limits::LimitsCache;
 use core::models::{
@@ -38,7 +39,11 @@ static SERVER_HANDLES: Lazy<Mutex<Vec<JoinHandle<()>>>> = Lazy::new(|| Mutex::ne
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    accounts: AccountRouter,
     limits: LimitsCache,
+    // One pooled client for every upstream call: Client::new() per request cost a
+    // fresh DNS+TCP+TLS handshake to chatgpt.com on every single LLM call.
+    client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -131,25 +136,28 @@ async fn main() {
 
 async fn run_login() -> anyhow::Result<()> {
     info!("Starting login process");
+    // The relay logs in only to its own dedicated auth directory (local_auth
+    // next to the executable, or RELAY_AUTH_DIR) — never ~/.codex or ~/.opencode,
+    // so relay credentials cannot mix with a normal Codex install.
     let config = Config::load()?;
     let auth_dir = config.codex_home;
     let auth_path = auth_dir.join("auth.json");
 
     std::fs::create_dir_all(&auth_dir)?;
     println!("Relay auth directory: {:?}", auth_dir);
-    println!("Relay auth file: {:?}", auth_path);
-    println!("This login is isolated from ~/.codex and ~/.opencode.");
+    println!("Expected auth file path: {:?}", auth_path);
 
     login::lib::login_with_chatgpt(&auth_dir, false).await?;
-    if !auth_path.is_file() {
+    if !auth_path.exists() {
         return Err(anyhow::anyhow!(
-            "Login completed without creating the relay auth file at {:?}",
+            "Login did not produce {:?}. Check the browser window and try again.",
             auth_path
         ));
     }
 
+    println!("Auth file created successfully at: {:?}", auth_path);
     info!("Login successful");
-    println!("Relay login completed: {:?}", auth_path);
+    println!("Login completed!");
     Ok(())
 }
 
@@ -167,10 +175,19 @@ fn display_menu() {
 
 fn get_user_choice() -> String {
     let mut choice = String::new();
-    io::stdin()
-        .read_line(&mut choice)
-        .expect("Failed to read input");
-    choice.trim().to_string()
+    match io::stdin().read_line(&mut choice) {
+        // EOF (stdin closed or redirected input ran out).  Without this the
+        // menu loop spins forever printing "Invalid choice" at 100% CPU.
+        Ok(0) => {
+            println!("stdin closed; exiting.");
+            "5".to_string()
+        }
+        Ok(_) => choice.trim().to_string(),
+        Err(error) => {
+            println!("Failed to read input ({error}); exiting.");
+            "5".to_string()
+        }
+    }
 }
 
 async fn run_server() -> anyhow::Result<()> {
@@ -188,36 +205,54 @@ async fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    // Check authentication
-    match check_authentication(&config).await {
-        Ok(_) => info!("Authentication check passed"),
-        Err(e) => {
-            error!("Authentication check failed: {}", e);
-            error!("Choose menu option 3 (Login) to create the relay's separate authorization.");
-            return Err(e);
-        }
-    }
+    // Load the active subscription and any standby before accepting traffic.
+    let accounts = AccountRouter::load(&config.codex_home).await?;
 
     // Create app state
+    let client = reqwest::Client::builder()
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|error| {
+            warn!("shared client builder failed ({}), falling back to default", error);
+            reqwest::Client::new()
+        });
     let app_state = AppState {
         config,
+        accounts,
         limits: LimitsCache::default(),
+        client,
     };
 
-    // Create router
+    // Create router.  The chat endpoint answers both with and without the /v1
+    // prefix: OpenAI-compatible clients disagree about whether base_url already
+    // contains "/v1", and a silent 404 from the bare router is a support trap.
+    // Same for /models vs /v1/models.
     let app = Router::new()
         .route(
             "/chat/completions",
             post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
         )
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
+        )
         .route("/v1/models", get(models_handler))
+        .route("/models", get(models_handler))
         .route("/v1/limits", get(limits_handler))
+        .route("/v1/account", get(account_handler))
+        .route("/v1/account/switch", post(account_switch_handler))
         .route("/health", get(health_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
-    // Configure server
-    let addr = SocketAddr::from(([127, 0, 0, 1], 5011));
+    // Configure server.  Loopback only, deliberately; RELAY_PORT rescues the
+    // rare machine where 5011 is already taken.
+    let port = std::env::var("RELAY_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(5011);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     info!("Server listening on {}", addr);
 
     // Start server and block until it exits
@@ -233,11 +268,11 @@ async fn refresh_token() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::load()?;
 
-    // Get the codex auth
+    // Get the relay's own auth (never ~/.codex or the OPENAI_API_KEY env var)
     let codex_auth = match CodexAuth::from_auth_dir(&config.codex_home) {
         Ok(Some(auth)) => auth,
         _ => {
-            return Err(anyhow::anyhow!("Dedicated relay authentication was not found. Choose menu option 3 (Login)."));
+            return Err(anyhow::anyhow!("No relay authentication found. Choose menu option 3 (Login) first."));
         }
     };
 
@@ -444,13 +479,17 @@ async fn check_authentication(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
+async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     info!("💓 Health check endpoint requested");
     let response = serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "service": "relay",
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("CARGO_PKG_VERSION"),
+        "account_router": {
+            "active_slot": state.accounts.active_slot().await,
+            "configured_slots": state.accounts.account_count(),
+        }
     });
     info!("✅ Health check response: {}", response);
     Json(response)
@@ -466,7 +505,7 @@ async fn models_handler(State(_state): State<AppState>) -> Json<ModelList> {
 }
 
 async fn limits_handler(State(state): State<AppState>) -> Response {
-    match state.limits.get(&state.config).await {
+    match state.limits.get(&state.accounts).await {
         Ok(value) => {
             let mut response = Json(value.clone()).into_response();
             core::limits::apply_response_headers(response.headers_mut(), &value);
@@ -487,6 +526,191 @@ async fn limits_handler(State(state): State<AppState>) -> Response {
                 .into_response()
         }
     }
+}
+
+/// Which subscriptions exist and which one is live right now.
+///
+/// The active slot lives in the router's memory, so editing auth files on a
+/// running relay changes nothing until a restart.  Without this pair of
+/// endpoints "switch me to the other subscription" had no executor at all —
+/// only an instruction telling a human to do it by hand.
+async fn account_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "active_slot": state.accounts.active_slot().await,
+        "configured_slots": state.accounts.account_count(),
+        "slots": state.accounts.describe().await,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct AccountSwitchRequest {
+    slot: String,
+}
+
+async fn account_switch_handler(
+    State(state): State<AppState>,
+    payload: Result<Json<AccountSwitchRequest>, JsonRejection>,
+) -> Response {
+    let requested = match payload {
+        Ok(Json(request)) => request.slot,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("expected {{\"slot\": \"...\"}}: {rejection}"),
+                        "type": "invalid_request_error",
+                        "code": "invalid_json"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let previous = state.accounts.active_slot().await;
+    match state.accounts.switch_to(&requested).await {
+        Ok(lease) => {
+            info!("account switch requested: {} -> {}", previous, lease.slot);
+            // No cache to clear: LimitsCache is keyed by account, and `get`
+            // leases the active slot first — so "how much is left?" already
+            // answers about the subscription that is now live.
+            Json(serde_json::json!({
+                "previous_slot": previous,
+                "active_slot": lease.slot,
+                "slots": state.accounts.describe().await,
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            warn!("account switch refused: {}", error);
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": error.to_string(),
+                        "type": "account_switch_refused",
+                        "code": "switch_refused"
+                    },
+                    "active_slot": state.accounts.active_slot().await,
+                    "slots": state.accounts.describe().await,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Collect the upstream chunk stream into one OpenAI-shaped `chat.completion`.
+///
+/// The upstream path is stream-only, and until now the parsed `"stream": false`
+/// was ignored — every client got SSE whether it could read it or not, so a
+/// non-streaming OpenAI SDK call tried to parse an SSE body as JSON and failed.
+/// Tool calls arrive as complete calls (one array element each, with its own
+/// index), so aggregation appends them; content concatenates; the last
+/// finish_reason, usage, and relay_terminal win.
+async fn aggregate_to_single_response(
+    mut chunks: tokio::sync::mpsc::Receiver<anyhow::Result<core::models::ResponseEvent>>,
+    requested_model: String,
+) -> Response {
+    let mut id = None;
+    let mut created = None;
+    let mut role = String::from("assistant");
+    let mut content = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<core::models::Usage> = None;
+    let mut relay_terminal: Option<core::models::RelayTerminal> = None;
+
+    while let Some(event) = chunks.recv().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                error!("Non-streaming aggregation failed mid-stream: {}", error);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Upstream stream failed: {}", error),
+                            "type": "upstream_error",
+                            "code": "stream_error"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if id.is_none() {
+            id = Some(event.id.clone());
+            created = Some(event.created);
+        }
+        if event.usage.is_some() {
+            usage = event.usage.clone();
+        }
+        if event.relay_terminal.is_some() {
+            relay_terminal = event.relay_terminal.clone();
+        }
+        for choice in &event.choices {
+            if let Some(new_role) = &choice.delta.role {
+                role = new_role.clone();
+            }
+            if let Some(chunk_content) = &choice.delta.content {
+                content.push_str(chunk_content);
+            }
+            if let Some(calls) = choice.delta.tool_calls.as_ref().and_then(|v| v.as_array()) {
+                tool_calls.extend(calls.iter().cloned());
+            }
+            if let Some(reason) = &choice.finish_reason {
+                finish_reason = Some(reason.clone());
+            }
+        }
+    }
+
+    let Some(id) = id else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Upstream produced no chunks at all",
+                    "type": "upstream_error",
+                    "code": "empty_response"
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    // OpenAI returns content: null (not "") on a pure tool-call turn.
+    let content_value = if content.is_empty() && !tool_calls.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(content)
+    };
+    let mut message = serde_json::json!({ "role": role, "content": content_value });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+    let mut body = serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        "model": requested_model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_string()),
+        }],
+        "usage": usage.unwrap_or(core::models::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_tokens_details: None,
+        }),
+    });
+    if let Some(terminal) = relay_terminal {
+        body["relay_terminal"] =
+            serde_json::to_value(&terminal).unwrap_or(serde_json::Value::Null);
+    }
+    Json(body).into_response()
 }
 
 async fn chat_completions_handler(
@@ -563,9 +787,23 @@ async fn chat_completions_handler(
             .into_response());
     }
 
+    let wants_stream = request.stream;
+    let requested_model = request.model.clone();
+
     // Process the chat completion
-    match chat_completions::stream_chat_completions(&state.config, request).await {
+    match chat_completions::stream_chat_completions(
+        &state.config,
+        state.accounts.clone(),
+        request,
+        state.client.clone(),
+    )
+    .await
+    {
         Ok(response_stream) => {
+            if !wants_stream {
+                info!("✅ Chat completion started (non-streaming aggregation)");
+                return Ok(aggregate_to_single_response(response_stream, requested_model).await);
+            }
             info!("✅ Chat completion stream started successfully");
             // Convert the response stream to SSE
             let sse_stream = tokio_stream::wrappers::ReceiverStream::new(response_stream)
