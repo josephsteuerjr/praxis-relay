@@ -140,24 +140,124 @@ async fn run_login() -> anyhow::Result<()> {
     // next to the executable, or RELAY_AUTH_DIR) — never ~/.codex or ~/.opencode,
     // so relay credentials cannot mix with a normal Codex install.
     let config = Config::load()?;
-    let auth_dir = config.codex_home;
-    let auth_path = auth_dir.join("auth.json");
+    let auth_root = config.codex_home;
+
+    println!("Login into which subscription slot?");
+    println!("  [Enter] primary   — the main subscription");
+    println!("  2       secondary — a standby subscription for quota failover");
+    print!("Slot: ");
+    io::stdout().flush().unwrap();
+    let secondary = get_user_choice() == "2";
+
+    let accounts_root = auth_root.join("accounts");
+    let legacy_auth = auth_root.join("auth.json");
+    let auth_dir = if secondary {
+        // The account router reads either the single legacy auth.json OR the
+        // accounts/ layout — never both.  A second subscription therefore
+        // needs the layout; migrate an existing single login into primary
+        // instead of silently orphaning it.
+        let primary_dir = accounts_root.join("primary");
+        if legacy_auth.is_file() && !primary_dir.join("auth.json").is_file() {
+            std::fs::create_dir_all(&primary_dir)?;
+            std::fs::rename(&legacy_auth, primary_dir.join("auth.json"))?;
+            println!(
+                "Moved the existing login to {:?} (slot primary).",
+                primary_dir.join("auth.json")
+            );
+        }
+        accounts_root.join("secondary")
+    } else if accounts_root.join("primary").join("auth.json").is_file()
+        || accounts_root.join("secondary").join("auth.json").is_file()
+    {
+        // The layout already exists: a primary (re-)login belongs in its slot.
+        accounts_root.join("primary")
+    } else {
+        // Single-account install: keep the simple single-file layout.
+        auth_root.clone()
+    };
 
     std::fs::create_dir_all(&auth_dir)?;
-    println!("Relay auth directory: {:?}", auth_dir);
-    println!("Expected auth file path: {:?}", auth_path);
+    let auth_path = auth_dir.join("auth.json");
+    println!("Relay auth file: {:?}", auth_path);
 
-    login::lib::login_with_chatgpt(&auth_dir, false).await?;
-    if !auth_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Login did not produce {:?}. Check the browser window and try again.",
-            auth_path
-        ));
+    // Success is defined by auth.json landing on disk, NOT by the login helper
+    // exiting: the helper's HTTP server only shuts itself down when the browser
+    // loads /success, and it kills itself on ANY unexpected request (a page
+    // refresh, even favicon.ico).  Waiting for the process therefore hung the
+    // menu after perfectly successful logins, and a refresh made a successful
+    // login look failed.  Watch the file, and stop the helper ourselves.
+    let modified_before = std::fs::metadata(&auth_path)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let auth_written = |before: &Option<std::time::SystemTime>| {
+        let now = std::fs::metadata(&auth_path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        now.is_some() && now != *before
+    };
+
+    let spawned = login::lib::spawn_login_with_chatgpt(&auth_dir)?;
+    println!("A browser window should open. Sign in to the ChatGPT account for this slot.");
+
+    let started = std::time::Instant::now();
+    let mut printed_url = false;
+    let outcome = loop {
+        if auth_written(&modified_before) {
+            break Ok(());
+        }
+        if !printed_url {
+            // get_login_url returns the last http token from the helper's
+            // stderr; early on that is its own "http://localhost:1455" banner.
+            // The real sign-in URL is the https:// one — wait for it.
+            if let Some(url) = spawned.get_login_url() {
+                if url.starts_with("https://") {
+                    println!("If the browser did not open, use this URL:\n\n{url}\n");
+                    printed_url = true;
+                }
+            }
+        }
+        let exit_status = spawned
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok().flatten());
+        if let Some(status) = exit_status {
+            // The helper may exit right after writing the file (or die on a
+            // stray browser request just after success) — check once more.
+            if auth_written(&modified_before) {
+                break Ok(());
+            }
+            let stderr_tail = spawned
+                .stderr
+                .lock()
+                .ok()
+                .map(|buffer| String::from_utf8_lossy(&buffer).to_string())
+                .unwrap_or_default();
+            let tail_start = stderr_tail.len().saturating_sub(400);
+            break Err(anyhow::anyhow!(
+                "Login helper exited ({status}) before {:?} was written.\n{}",
+                auth_path,
+                &stderr_tail[tail_start..]
+            ));
+        }
+        if started.elapsed() > std::time::Duration::from_secs(600) {
+            break Err(anyhow::anyhow!("Login timed out after 10 minutes."));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+
+    // The helper's job ends the moment auth.json lands; left alone it lingers
+    // on port 1455 until the browser hits /success.  Stop it either way.
+    if let Ok(mut child) = spawned.child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    outcome?;
 
     println!("Auth file created successfully at: {:?}", auth_path);
     info!("Login successful");
     println!("Login completed!");
+    println!("If the relay server was running while you added a NEW slot, restart it to pick the slot up.");
     Ok(())
 }
 
@@ -263,33 +363,56 @@ async fn run_server() -> anyhow::Result<()> {
 }
 
 async fn refresh_token() -> anyhow::Result<()> {
-    println!("Refreshing token...");
+    println!("Refreshing token(s)...");
 
     // Load configuration
     let config = Config::load()?;
 
-    // Get the relay's own auth (never ~/.codex or the OPENAI_API_KEY env var)
-    let codex_auth = match CodexAuth::from_auth_dir(&config.codex_home) {
-        Ok(Some(auth)) => auth,
-        _ => {
-            return Err(anyhow::anyhow!("No relay authentication found. Choose menu option 3 (Login) first."));
-        }
-    };
+    // Walk every place a login can live: the legacy single file and both
+    // account slots.  Menu 3 may have migrated the login into accounts/, and
+    // a refresh that only ever looked at the root would report "no auth" on a
+    // perfectly logged-in relay.
+    let auth_root = config.codex_home;
+    let candidates = [
+        ("primary (legacy)", auth_root.clone()),
+        ("primary", auth_root.join("accounts").join("primary")),
+        ("secondary", auth_root.join("accounts").join("secondary")),
+    ];
 
-    // Get token data which will automatically refresh if needed
-    let token_data = match codex_auth.get_token_data().await {
-        Ok(data) => data,
-        Err(_) => {
-            return Err(anyhow::anyhow!("Relay token data is unavailable. Choose menu option 3 (Login)."));
+    let mut refreshed = 0;
+    for (slot, dir) in candidates {
+        if !dir.join("auth.json").is_file() {
+            continue;
         }
-    };
-
-    println!("Token refreshed successfully!");
-    match &token_data.account_id {
-        Some(account_id) => println!("Account ID: {}", account_id),
-        None => println!("Account ID: None"),
+        // The relay's own auth only — never ~/.codex or the OPENAI_API_KEY env var
+        let codex_auth = match CodexAuth::from_auth_dir(&dir) {
+            Ok(Some(auth)) => auth,
+            _ => {
+                println!("Slot {slot}: auth.json is invalid. Choose menu option 3 (Login) to replace it.");
+                continue;
+            }
+        };
+        // Get token data which will automatically refresh if needed
+        match codex_auth.get_token_data().await {
+            Ok(data) => {
+                refreshed += 1;
+                match &data.account_id {
+                    Some(account_id) => println!("Slot {slot}: token OK, account {account_id}"),
+                    None => println!("Slot {slot}: token OK, account id missing"),
+                }
+            }
+            Err(error) => {
+                println!("Slot {slot}: refresh failed ({error}). Choose menu option 3 (Login).");
+            }
+        }
     }
 
+    if refreshed == 0 {
+        return Err(anyhow::anyhow!(
+            "No usable relay authentication found. Choose menu option 3 (Login) first."
+        ));
+    }
+    println!("Done: {refreshed} slot(s) refreshed.");
     Ok(())
 }
 
