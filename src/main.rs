@@ -16,6 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // Modules
 mod core;
 mod login;
+#[cfg(target_family = "windows")]
+mod tray;
 
 use core::chat_completions;
 use core::account_router::AccountRouter;
@@ -358,6 +360,12 @@ async fn run_server() -> anyhow::Result<()> {
     // Start server and block until it exits
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     println!("Server is running. Press Ctrl+C to stop.");
+    #[cfg(target_family = "windows")]
+    {
+        println!("The relay minimizes to the system tray (icon by the clock).");
+        println!("Double-click the tray icon to show this window again; quit from the tray menu.");
+        tray::spawn(port);
+    }
     axum::serve(listener, app).await.unwrap();
     Ok(())
 }

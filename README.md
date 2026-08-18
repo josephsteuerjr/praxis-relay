@@ -49,6 +49,11 @@ Menu `3` logs the relay into your ChatGPT account (a browser opens; Python 3 is 
 for this step — `python.exe`, `py -3`, and `python3.exe` are discovered automatically, or
 set `RELAY_PYTHON`). Menu `1` starts the server. Check `http://127.0.0.1:5011/health`.
 
+Once the server is running the console hides into a **system tray icon**: double-click the
+icon to show or hide the window (with its live log), and quit from the tray menu. Adding a
+second subscription: run menu `3` again and answer `2` to the slot question — the existing
+login migrates to slot `primary` automatically; restart the server to pick the new slot up.
+
 On Linux, `cargo run` behaves the same; the Dockerfile provides a container build. The
 process deliberately binds only to loopback — expose it through a reverse proxy only as an
 explicit deployment decision.
