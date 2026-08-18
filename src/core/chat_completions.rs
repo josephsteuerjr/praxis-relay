@@ -452,16 +452,157 @@ fn build_responses_input(messages: &[Message]) -> Vec<Value> {
     input_messages
 }
 
+/// Rewrite an arbitrary client JSON schema into the strict subset the Codex
+/// backend validates when a function is sent with `strict: true` (the relay
+/// default): every object schema must carry `additionalProperties: false` and
+/// a `required` array listing EVERY property key.
+///
+/// Clients that were written for this backend already conform.  Clients that
+/// were not — framework tool registries, MCP servers — send ordinary JSON
+/// schemas, and one non-conforming function 400s the whole request
+/// (`invalid_function_parameters`, live case 18.08: Ouroboros's 98-tool turn
+/// died on `advisory_review`).  Fixing the schemas at the source would mean
+/// patching every framework; the relay normalizes instead.
+///
+/// Optionality is preserved, not dropped: a property that was NOT in the
+/// original `required` gets `null` added to its type (and enum, if any), which
+/// is exactly how the strict contract spells "optional".
+fn strictify_schema(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    // Recurse into every position that holds a subschema.
+    for key in ["items", "contains", "not"] {
+        if let Some(sub) = obj.get_mut(key) {
+            if let Some(arr) = sub.as_array_mut() {
+                for v in arr {
+                    strictify_schema(v);
+                }
+            } else {
+                strictify_schema(sub);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(arr) = obj.get_mut(key).and_then(Value::as_array_mut) {
+            for v in arr {
+                strictify_schema(v);
+            }
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(map) = obj.get_mut(key).and_then(Value::as_object_mut) {
+            for (_name, v) in map.iter_mut() {
+                strictify_schema(v);
+            }
+        }
+    }
+    if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+        for (_name, v) in props.iter_mut() {
+            strictify_schema(v);
+        }
+    }
+
+    let declares_object = match obj.get("type") {
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
+        _ => false,
+    };
+    if !declares_object && !obj.contains_key("properties") {
+        return;
+    }
+
+    let property_names: Vec<String> = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default();
+    let previously_required: Vec<String> = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+        for (name, prop) in props.iter_mut() {
+            if !previously_required.contains(name) {
+                make_nullable(prop);
+            }
+        }
+    }
+
+    obj.insert("required".to_string(), json!(property_names));
+    // Schema-valued additionalProperties (map-typed params) cannot survive: the
+    // strict contract only accepts literal false here, so a map param would be
+    // rejected upstream in any shape we could send it.
+    obj.insert("additionalProperties".to_string(), json!(false));
+    if !obj.contains_key("type") {
+        obj.insert("type".to_string(), json!("object"));
+    }
+}
+
+/// Spell "optional" the way the strict contract wants: `null` joins the type
+/// (and the enum, if one constrains the values, so null stays actually usable).
+fn make_nullable(prop: &mut Value) {
+    let Some(obj) = prop.as_object_mut() else {
+        return;
+    };
+    let mut added_null = false;
+    match obj.get_mut("type") {
+        Some(Value::String(t)) => {
+            if t != "null" {
+                let existing = t.clone();
+                obj.insert("type".to_string(), json!([existing, "null"]));
+                added_null = true;
+            }
+        }
+        Some(Value::Array(types)) => {
+            if !types.iter().any(|t| t == "null") {
+                types.push(json!("null"));
+                added_null = true;
+            }
+        }
+        _ => {
+            if let Some(any) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
+                if !any
+                    .iter()
+                    .any(|branch| branch.get("type").is_some_and(|t| t == "null"))
+                {
+                    any.push(json!({"type": "null"}));
+                }
+            }
+        }
+    }
+    if added_null {
+        if let Some(options) = obj.get_mut("enum").and_then(Value::as_array_mut) {
+            if !options.iter().any(Value::is_null) {
+                options.push(Value::Null);
+            }
+        }
+    }
+}
+
 fn map_tools_for_responses(tools: &[Tool]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| match tool {
             Tool::Function { function } => {
+                let strict = function.strict.unwrap_or(true);
+                let mut parameters = function.parameters.clone();
+                if strict {
+                    strictify_schema(&mut parameters);
+                }
                 let mut mapped = json!({
                     "type": "function",
                     "name": function.name,
-                    "parameters": function.parameters,
-                    "strict": function.strict.unwrap_or(true),
+                    "parameters": parameters,
+                    "strict": strict,
                 });
                 if let Some(description) = &function.description {
                     mapped["description"] = json!(description);
@@ -1492,6 +1633,99 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::tempdir;
+
+    /// ЖИВОЙ СЛУЧАЙ 18.08.2026: 98-тульный ход Уробороса умер об
+    /// `invalid_function_parameters` на первой же обычной (нестрогой) схеме.
+    /// Реле шлёт функции со strict:true, значит обязано само приводить чужие
+    /// схемы к строгому подмножеству: additionalProperties:false и required со
+    /// ВСЕМИ ключами на каждом объекте, а бывшая необязательность — через null.
+    #[test]
+    fn arbitrary_tool_schemas_are_strictified_for_upstream() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function",
+            "function": {
+                "name": "advisory_review",
+                "description": "framework tool with an ordinary JSON schema",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["fast", "deep"]},
+                        "files": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"]
+                        }}
+                    },
+                    "required": ["scope"]
+                }
+            }
+        }]))
+        .unwrap();
+
+        let mapped = map_tools_for_responses(&tools);
+        let parameters = &mapped[0]["parameters"];
+
+        assert_eq!(parameters["additionalProperties"], json!(false));
+        // serde_json keeps object keys sorted; the set is what matters upstream.
+        assert_eq!(parameters["required"], json!(["files", "mode", "scope"]));
+        // A property that was required keeps its exact type.
+        assert_eq!(parameters["properties"]["scope"]["type"], json!("string"));
+        // An optional property becomes nullable, and its enum learns null too —
+        // otherwise "null allowed by type, forbidden by enum" is a trap.
+        assert_eq!(
+            parameters["properties"]["mode"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(parameters["properties"]["mode"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(Value::is_null));
+        // Nesting is covered: the object inside the array got the same pass.
+        let item = &parameters["properties"]["files"]["items"];
+        assert_eq!(item["additionalProperties"], json!(false));
+        assert_eq!(item["required"], json!(["path"]));
+        assert_eq!(item["properties"]["path"]["type"], json!("string"));
+        assert_eq!(mapped[0]["strict"], json!(true));
+    }
+
+    /// Явный strict:false от клиента — осознанный выбор, схему не трогаем.
+    #[test]
+    fn explicit_strict_false_forwards_the_schema_untouched() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function",
+            "function": {
+                "name": "loose_tool",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+                "strict": false
+            }
+        }]))
+        .unwrap();
+
+        let mapped = map_tools_for_responses(&tools);
+        assert_eq!(mapped[0]["strict"], json!(false));
+        assert!(mapped[0]["parameters"].get("additionalProperties").is_none());
+        assert!(mapped[0]["parameters"].get("required").is_none());
+    }
+
+    /// Уже строгая схема (клиент в духе Praxis) проходит без изменений —
+    /// нормализация идемпотентна и не портит конформные контракты.
+    #[test]
+    fn a_conforming_schema_survives_strictification_unchanged() {
+        let strict_schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": ["integer", "null"]}
+            },
+            "required": ["limit", "query"],
+            "additionalProperties": false
+        });
+        let mut normalized = strict_schema.clone();
+        strictify_schema(&mut normalized);
+        assert_eq!(normalized, strict_schema);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  РЕАЛЬНЫЙ ПУТЬ. Здесь поднимается настоящий HTTP-апстрим на 127.0.0.1, а ход

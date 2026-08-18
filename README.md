@@ -50,6 +50,13 @@ The relay can stand in for a llama.cpp-style localhost server, so agent framewor
   which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
   still a strict-list 404, so typos in real model names keep failing loudly.
 - Requests without `"stream": true` get a single aggregated JSON response.
+- Function tools are sent upstream with `strict: true` (the relay default), and the backend
+  validates their JSON schemas against the strict subset: `additionalProperties: false` plus
+  a full `required` on every object. Ordinary framework/MCP schemas do not conform, and one
+  non-conforming function used to 400 the whole request — so the relay normalizes every
+  schema to the strict subset, preserving optionality by adding `null` to the type (and
+  enum) of properties that were not originally required. A client that explicitly sets
+  `strict: false` on a function gets its schema forwarded untouched.
 
 The Ollama-native protocol (`/api/tags`, `/api/chat`) is not spoken; use a framework's
 OpenAI-compatible mode.
