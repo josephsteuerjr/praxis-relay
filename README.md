@@ -81,7 +81,10 @@ explicit deployment decision.
 - `RELAY_PYTHON` — explicit Python 3 interpreter for the login helper.
 - `RELAY_REASONING_EFFORT` — default reasoning effort applied when a request carries none
   (`none` by default; requests may override via their own `reasoning_effort` field).
-- `RELAY_INSTRUCTIONS` — `codex` (default) or `minimal` system-instructions mode.
+- `RELAY_INSTRUCTIONS` — `minimal` (default: a ~60-word stub; your agent's own system
+  prompt travels in the input either way) or `codex` (the full ~5k-token Codex-CLI
+  preamble on every call). A rejected minimal request automatically retries with the
+  full prompt.
 - `RELAY_PARALLEL_TOOL_CALLS` — `true` (default) or `false`.
 - `RELAY_ACCOUNT_COOLDOWN_SECONDS` — how long an exhausted subscription slot stays parked.
 - `RELAY_LOG_DIR` — log directory, default `logs` under the working directory.

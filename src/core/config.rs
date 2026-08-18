@@ -47,16 +47,24 @@ impl Config {
         })
     }
 
-    /// RELAY_INSTRUCTIONS: "codex" (default — full vendored prompt.md, known-accepted
-    /// by the backend) or "minimal" — a ~60-word neutral stub instead of ~5k tokens of
-    /// coding-agent instructions per call.  When minimal is rejected upstream (4xx) the
-    /// request is retried once with the full prompt, so the worst case is the default.
+    /// RELAY_INSTRUCTIONS: "minimal" (default — a ~60-word neutral stub; the client's
+    /// real system prompt travels inside the input as a <system> message anyway) or
+    /// "codex" — the full vendored prompt.md, ~5k tokens of coding-agent instructions
+    /// burned on EVERY call and steering the model toward Codex-CLI behavior.  When
+    /// minimal is rejected upstream (4xx) the request is retried once with the full
+    /// prompt, so the worst case equals the codex mode.
     pub fn minimal_instructions(&self) -> bool {
         self.instructions_mode.as_deref() == Some("minimal")
     }
 
     fn load_instructions_mode() -> Option<String> {
-        std::env::var("RELAY_INSTRUCTIONS").ok().map(|v| v.trim().to_lowercase())
+        match std::env::var("RELAY_INSTRUCTIONS") {
+            Ok(value) => Some(value.trim().to_lowercase()),
+            // Unset defaults to minimal: agents bring their own system prompt,
+            // and the Codex coding-agent preamble only costs quota and skews
+            // behavior.  RELAY_INSTRUCTIONS=codex restores the old default.
+            Err(_) => Some("minimal".to_string()),
+        }
     }
 
     /// RELAY_PARALLEL_TOOL_CALLS: unset/"true" lets the model batch several tool calls
