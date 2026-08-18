@@ -13,8 +13,8 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, IsWindowVisible, PeekMessageW, SetForegroundWindow, ShowWindow,
-    TranslateMessage, MSG, PM_REMOVE, SW_HIDE, SW_SHOW,
+    DispatchMessageW, IsIconic, IsWindowVisible, PeekMessageW, SetForegroundWindow, ShowWindow,
+    TranslateMessage, MSG, PM_REMOVE, SW_HIDE, SW_RESTORE,
 };
 
 static SPAWNED: AtomicBool = AtomicBool::new(false);
@@ -65,6 +65,15 @@ fn run(port: u16) {
                 DispatchMessageW(&msg);
             }
         }
+        // The native minimize button returns the window to the tray.  The
+        // console's WndProc lives in conhost (another process), so this is
+        // watched rather than intercepted: minimized while visible → hide.
+        unsafe {
+            let window = GetConsoleWindow();
+            if window as usize != 0 && IsWindowVisible(window) != 0 && IsIconic(window) != 0 {
+                ShowWindow(window, SW_HIDE);
+            }
+        }
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id() == toggle.id() {
                 toggle_console();
@@ -89,7 +98,9 @@ fn set_console_visible(visible: bool) {
         if window as usize == 0 {
             return;
         }
-        ShowWindow(window, if visible { SW_SHOW } else { SW_HIDE });
+        // SW_RESTORE instead of SW_SHOW: a window hidden by the minimize
+        // button is still iconic, and SW_SHOW would bring it back minimized.
+        ShowWindow(window, if visible { SW_RESTORE } else { SW_HIDE });
         if visible {
             SetForegroundWindow(window);
         }
@@ -116,32 +127,39 @@ fn open_in_browser(url: &str) {
         .spawn();
 }
 
-/// A generated 32×32 icon (teal disc, white core) — no asset files to ship.
+/// A generated 64×64 icon (teal disc, white core) with anti-aliased edges —
+/// crisp at any tray scale, and no asset files to ship.
 fn icon() -> Icon {
-    const SIZE: usize = 32;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    const SIZE: usize = 64;
     let center = (SIZE as f32 - 1.0) / 2.0;
+    let outer = 29.0_f32;
+    let rim = 25.0_f32;
+    let core = 10.0_f32;
+    // Smooth 1px transition around a band edge: 1.0 inside, 0.0 outside.
+    let coverage = |distance: f32, edge: f32| (edge + 0.5 - distance).clamp(0.0, 1.0);
+
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
         for x in 0..SIZE {
             let dx = x as f32 - center;
             let dy = y as f32 - center;
             let distance = (dx * dx + dy * dy).sqrt();
-            let index = (y * SIZE + x) * 4;
-            let pixel: Option<[u8; 3]> = if distance <= 5.0 {
-                Some([236, 244, 243])
-            } else if distance <= 12.5 {
-                Some([16, 163, 152])
-            } else if distance <= 14.5 {
-                Some([10, 90, 84])
-            } else {
-                None
-            };
-            if let Some([r, g, b]) = pixel {
-                rgba[index] = r;
-                rgba[index + 1] = g;
-                rgba[index + 2] = b;
-                rgba[index + 3] = 255;
+            let alpha = coverage(distance, outer);
+            if alpha <= 0.0 {
+                continue;
             }
+            // Blend rim → body → core by band coverage.
+            let body = coverage(distance, rim);
+            let inner = coverage(distance, core);
+            let mix = |rim_c: f32, body_c: f32, core_c: f32| {
+                let with_body = rim_c * (1.0 - body) + body_c * body;
+                (with_body * (1.0 - inner) + core_c * inner) as u8
+            };
+            let index = (y * SIZE + x) * 4;
+            rgba[index] = mix(10.0, 16.0, 236.0);
+            rgba[index + 1] = mix(90.0, 163.0, 244.0);
+            rgba[index + 2] = mix(84.0, 152.0, 243.0);
+            rgba[index + 3] = (alpha * 255.0) as u8;
         }
     }
     Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).expect("static icon dimensions are valid")

@@ -50,6 +50,16 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // Declare per-monitor DPI awareness before any window exists: without it
+    // Windows bitmap-scales the process UI on high-DPI displays and the tray
+    // context menu renders blurry.  The console window itself belongs to
+    // conhost and manages its own DPI either way.
+    #[cfg(target_family = "windows")]
+    unsafe {
+        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
     // The container runs from /app, whose logs directory is the persisted
     // compose mount. RELAY_LOG_DIR keeps non-container deployments explicit.
     let logs_dir = std::env::var_os("RELAY_LOG_DIR")

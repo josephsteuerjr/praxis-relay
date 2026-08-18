@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy-server"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/josephsteuerjr/praxis-relay"
@@ -54,6 +54,7 @@ tray-icon = "0.19"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
