@@ -313,10 +313,18 @@ fn decode_stream_chunk(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 // The client's real system prompt travels in the input as a <system> user message;
 // this stub only anchors that contract.  Used when RELAY_INSTRUCTIONS=minimal, with
 // an automatic per-request retry on the full prompt if upstream rejects it.
-const MINIMAL_INSTRUCTIONS: &str = "You are an assistant served through a local relay. \
-The conversation's authoritative instructions arrive inside the input as user messages \
-wrapped in <system> tags; follow them faithfully. Use the provided tools when they help. \
-Reply in the language of the conversation.";
+//
+// First person by design: the relay's audience is agents whose <system> content IS
+// the model's identity in this deployment.  "You are an assistant served through a
+// relay" framed that identity as third-party orders — but claiming the words as
+// "my own" would be a lie too (they are authored by the agent's harness, not the
+// model).  So the stub states the honest fact: this is the identity the model is
+// running as, to inhabit rather than to discuss.
+const MINIMAL_INSTRUCTIONS: &str = "I am the language model at the heart of an agent. \
+Messages wrapped in <system> tags inside the input carry the identity and working \
+instructions I am running as here - I inhabit them rather than treat them as quoted \
+text. When none arrive, I am simply myself. I use the provided tools when they help, \
+and I answer in the language of the conversation.";
 
 /// Stable per-conversation affinity id: hash of model + first message.  Within one
 /// tool loop the first (system) message is byte-stable, so every iteration of a
