@@ -119,6 +119,11 @@ The relay can stand in for a llama.cpp-style localhost server, so agent framewor
   which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
   still a strict-list 404, so typos in real model names keep failing loudly.
 - Requests without `"stream": true` get a single aggregated JSON response.
+- `tool_choice` travels through — `"required"`, `"none"`, and named-function forms included
+  (the Chat-Completions `{"type":"function","function":{"name":…}}` shape is reshaped for
+  the Responses API), so a client's mandatory tool call stays mandatory. `response_format`
+  maps to the Responses `text.format`: `json_object` and flattened `json_schema` (whose
+  schema passes the same strictifier). Both verified live.
 - Function tools are sent upstream with `strict: true` (the relay default), and every tool
   schema is normalized to the strict subset the backend validates: `additionalProperties:
   false` plus a full `required` on every object, a `type` synthesized for shapeless nodes

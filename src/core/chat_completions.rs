@@ -713,12 +713,76 @@ fn build_responses_payload(
 
     if !mapped_tools.is_empty() {
         payload["tools"] = json!(mapped_tools);
-        payload["tool_choice"] = json!("auto");
+        // The client's tool_choice travels through.  It used to be hardcoded
+        // to "auto", which silently turned a mandatory tool call into an
+        // optional one — Ouroboros's context compaction sends
+        // tool_choice="required" and trusts the call to actually happen.
+        payload["tool_choice"] = request
+            .tool_choice
+            .as_ref()
+            .map(map_tool_choice_for_responses)
+            .unwrap_or_else(|| json!("auto"));
         // true lets the model batch several tool calls per response; the translator
         // assigns incrementing indexes and the client executes the whole batch.
         payload["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
+    if let Some(response_format) = &request.response_format {
+        if let Some(format) = map_response_format_for_responses(response_format) {
+            payload["text"] = json!({ "format": format });
+        }
+    }
     payload
+}
+
+/// Chat-Completions `tool_choice` → Responses API shape.
+///
+/// Strings ("auto"/"required"/"none") pass through; the nested
+/// `{"type":"function","function":{"name":N}}` form flattens to the Responses
+/// `{"type":"function","name":N}`; anything else is forwarded as-is and left
+/// to the upstream validator (the conservative retry resets it to "auto").
+fn map_tool_choice_for_responses(choice: &Value) -> Value {
+    if let Some(name) = choice
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+    {
+        return json!({"type": "function", "name": name});
+    }
+    choice.clone()
+}
+
+/// Chat-Completions `response_format` → Responses API `text.format`.
+///
+/// `json_schema` flattens to `{type,name,strict,schema}`, and its schema goes
+/// through the same strictifier as tool parameters — the backend applies the
+/// same strict validation there.  Unknown types are dropped rather than
+/// guessed at.
+fn map_response_format_for_responses(response_format: &Value) -> Option<Value> {
+    let kind = response_format.get("type").and_then(Value::as_str)?;
+    match kind {
+        "text" | "json_object" => Some(json!({ "type": kind })),
+        "json_schema" => {
+            let inner = response_format.get("json_schema")?;
+            let mut format = json!({ "type": "json_schema" });
+            if let Some(name) = inner.get("name") {
+                format["name"] = name.clone();
+            }
+            let strict = inner
+                .get("strict")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            format["strict"] = json!(strict);
+            if let Some(schema) = inner.get("schema") {
+                let mut schema = schema.clone();
+                if strict {
+                    strictify_schema(&mut schema);
+                }
+                format["schema"] = schema;
+            }
+            Some(format)
+        }
+        _ => None,
+    }
 }
 
 fn build_codex_request(
@@ -937,6 +1001,17 @@ pub async fn stream_chat_completions(
                         if let Some(object) = payload.as_object_mut() {
                             object.remove("reasoning");
                             object.remove("prompt_cache_key");
+                            // Forwarded client knobs come off too.  Downgrading
+                            // tool_choice to "auto" here weakens a "required",
+                            // but only on the path where the request would
+                            // otherwise die entirely.
+                            object.remove("text");
+                            if object.contains_key("tool_choice") {
+                                object.insert(
+                                    "tool_choice".to_string(),
+                                    serde_json::json!("auto"),
+                                );
+                            }
                             if minimal {
                                 object.insert(
                                     "instructions".to_string(),
@@ -1806,6 +1881,86 @@ mod tests {
             payload["properties"]["type"]["type"],
             json!(["string", "null"])
         );
+    }
+
+    /// СТОП-СИГНАЛ из чужого разбора 19.08 (сверка Praxis vs CLIProxyAPI):
+    /// реле молча превращало tool_choice="required" в "auto" — компакция
+    /// контекста Уробороса (context_compaction.py:501) шлёт "required" и
+    /// доверяет, что вызов инструмента ОБЯЗАТЕЛЕН. Теперь ручки едут насквозь.
+    #[test]
+    fn tool_choice_and_response_format_travel_upstream() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+            "response_format": {"type": "json_object"},
+            "tools": [{"type": "function", "function": {
+                "name": "emit", "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .unwrap();
+        let payload =
+            build_responses_payload(&request, String::new(), Vec::new(), None, None, true);
+        assert_eq!(payload["tool_choice"], json!("required"));
+        assert_eq!(payload["text"]["format"]["type"], json!("json_object"));
+    }
+
+    #[test]
+    fn a_named_function_choice_is_reshaped_for_responses() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "function", "function": {"name": "emit"}},
+            "tools": [{"type": "function", "function": {
+                "name": "emit", "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .unwrap();
+        let payload =
+            build_responses_payload(&request, String::new(), Vec::new(), None, None, true);
+        assert_eq!(
+            payload["tool_choice"],
+            json!({"type": "function", "name": "emit"})
+        );
+    }
+
+    #[test]
+    fn absent_tool_choice_still_defaults_to_auto() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "emit", "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .unwrap();
+        let payload =
+            build_responses_payload(&request, String::new(), Vec::new(), None, None, true);
+        assert_eq!(payload["tool_choice"], json!("auto"));
+        assert!(payload.get("text").is_none());
+    }
+
+    /// json_schema-формат сплющивается в text.format Responses и его схема
+    /// проходит тот же стриктификатор, что и схемы инструментов.
+    #[test]
+    fn json_schema_response_format_is_flattened_and_strictified() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "report",
+                "schema": {"type": "object", "properties": {"note": {"type": "string"}}}
+            }}
+        }))
+        .unwrap();
+        let payload =
+            build_responses_payload(&request, String::new(), Vec::new(), None, None, true);
+        let format = &payload["text"]["format"];
+        assert_eq!(format["type"], json!("json_schema"));
+        assert_eq!(format["name"], json!("report"));
+        assert_eq!(format["strict"], json!(true));
+        assert_eq!(format["schema"]["additionalProperties"], json!(false));
+        assert_eq!(format["schema"]["required"], json!(["note"]));
     }
 
     /// Явный strict:false от клиента — осознанный выбор, схему не трогаем.

@@ -123,6 +123,14 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    // Forwarded verbatim-ish to the backend (see chat_completions mapping).
+    // Both used to be silently dropped, which turned a client's mandatory tool
+    // call (tool_choice: "required" — Ouroboros context compaction relies on
+    // it) into an optional one, and erased structured-output requests.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
