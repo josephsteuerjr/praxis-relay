@@ -20,6 +20,18 @@ pub const SUPPORTED_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
+    // GPT-5.3-Codex-Spark: Cerebras-served, text-only, 128k context, and metered
+    // from its OWN bucket — it shows up under `additional_rate_limits` in
+    // /v1/limits rather than sharing the main allowance, so it keeps answering
+    // after the main one is spent.  Measured on one long generation through this
+    // relay: ~400 chars/s against ~219 for gpt-5.4, and roughly a third of the
+    // wall clock because it also writes shorter.  Research preview on ChatGPT
+    // Pro; on a plan without it the request fails upstream, loudly, rather than
+    // being rejected here — which is the point of listing only real slugs.
+    // Its larger sibling `gpt-5.3-codex` is deliberately absent: upstream
+    // answers 400 for it, and an advertised slug that cannot be called is worse
+    // than one that was never advertised.
+    "gpt-5.3-codex-spark",
 ];
 
 /// The largest JSON body accepted by the Chat Completions endpoint.

@@ -90,12 +90,28 @@ request retries once on the full preamble rather than failing.
   streaming (SSE) when the request carries `"stream": true`, a single aggregated
   `chat.completion` JSON object otherwise. Tool calls and image input are supported.
 - `GET /v1/models` (alias: `GET /models`) — the supported model list
-  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) with advertised context
+  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
+  `gpt-5.3-codex-spark`) with advertised context
   metadata.
 - `GET /v1/limits` — remaining subscription quota as reported by the backend.
 - `GET /v1/account` / `POST /v1/account/switch` — inspect and deliberately switch the
   active subscription slot (see multi-account below).
 - `GET /health` — liveness plus the account-router state.
+
+## Codex-Spark, and the quota nobody is spending
+
+`gpt-5.3-codex-spark` is worth calling out because it is not simply one more slug.
+It is metered from a **separate bucket**: `/v1/limits` reports it under
+`additional_rate_limits` with its own five-hour and weekly windows, so it keeps
+answering after the main subscription allowance is spent. On one long generation
+through this relay it produced ~400 characters per second against ~219 for
+`gpt-5.4`, finishing in about a third of the wall clock — it writes faster and
+shorter. Two such calls consumed about 4% of the five-hour window, so the bucket
+is separate, not bottomless.
+
+The trade is real: it is text-only (no image input), its context is 128k rather
+than the 400k the other models advertise, and it is tuned for code rather than
+conversation. Treat it as a fast lane, not a default.
 
 ## Configuration (environment variables)
 
