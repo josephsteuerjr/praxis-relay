@@ -143,14 +143,20 @@ only; it deliberately contains no account data.
 
 ## License and provenance
 
-This project as a whole is distributed under the GNU Affero General Public License v3.0 —
-see [LICENSE](LICENSE).
+This project is distributed under the **MIT License** — see [LICENSE](LICENSE). Take it,
+fork it, vendor it, ship it closed — the only condition is that the copyright notice
+travels with the code.
 
 It is derived from
 [unluckyjori/Codex-Proxy-Server](https://github.com/unluckyjori/Codex-Proxy-Server)
-at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`, which is MIT-licensed.
-The original copyright and permission notice are preserved in [LICENSE.MIT](LICENSE.MIT),
+at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`, also MIT-licensed. The
+original copyright notice is carried in [LICENSE](LICENSE) alongside this project's own,
 as the MIT license requires.
+
+Parts of the sign-in path and `src/core/prompt.md` descend, through that upstream, from the
+[OpenAI Codex CLI](https://github.com/openai/codex) (Apache-2.0, Copyright 2025 OpenAI).
+[NOTICE](NOTICE) names those files and states that they were modified, as Apache-2.0
+requires of anyone redistributing them.
 
 This project is independently maintained and is not affiliated with or endorsed by OpenAI.
 It speaks the Codex protocol to the ChatGPT backend; treat it as an unofficial bridge and

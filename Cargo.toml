@@ -2,8 +2,10 @@
 name = "codex-proxy-server"
 version = "0.5.1"
 edition = "2021"
-license = "AGPL-3.0-only"
+authors = ["y.kosyrev <y.kosyrev@mailfence.com>"]
+license = "MIT"
 repository = "https://github.com/josephsteuerjr/praxis-relay"
+description = "Turn a ChatGPT subscription into a local OpenAI-compatible API"
 
 [dependencies]
 # Web server
