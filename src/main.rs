@@ -139,6 +139,11 @@ async fn main() {
                     error!("Failed to list running servers: {}", e);
                 }
             }
+            "7" => {
+                if let Err(e) = edit_instructions() {
+                    error!("Editing instructions failed: {}", e);
+                }
+            }
             _ => {
                 println!("Invalid choice. Please try again.");
             }
@@ -273,6 +278,92 @@ async fn run_login() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Menu 7: show what currently rides at the top of every request, and hand it over.
+///
+/// `instructions` is sent above the whole conversation on every call, and it is the
+/// one part of the prompt that an agent's own system prompt cannot reach: whatever
+/// stands there frames everything the agent says about itself afterwards.  Until now
+/// the text was compiled into the binary, so the relay spoke for its operator.  A
+/// plain file is the smallest thing that gives the words back.
+fn edit_instructions() -> anyhow::Result<()> {
+    let path = core::config::instructions_file_path();
+    println!();
+    println!("=== Instructions sent above every request ===");
+    println!("File: {}", path.display());
+    match core::config::custom_instructions() {
+        Some(text) => {
+            println!("Source: this file");
+            println!();
+            println!("{text}");
+        }
+        None => {
+            println!("Source: built-in text (the file is absent or blank)");
+            println!();
+            println!("{}", chat_completions::MINIMAL_INSTRUCTIONS);
+        }
+    }
+    println!();
+    println!("  e      write your own (opens an editor)");
+    println!("  r      reset to the built-in text (deletes the file)");
+    println!("  Enter  back");
+    print!("> ");
+    io::stdout().flush().ok();
+    let mut choice = String::new();
+    if io::stdin().read_line(&mut choice)? == 0 {
+        return Ok(());
+    }
+    match choice.trim() {
+        "e" | "E" => {
+            if !path.exists() {
+                // Seed with the built-in text.  Editing from a working example shows
+                // the shape the field expects; a blank page invites an empty file,
+                // which upstream would like even less than a wrong one.
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).ok();
+                }
+                let mut seed = chat_completions::MINIMAL_INSTRUCTIONS.to_string();
+                seed.push('\n');
+                std::fs::write(&path, seed)?;
+            }
+            open_in_editor(&path);
+            println!("Saved text applies to the next request; no restart needed.");
+        }
+        "r" | "R" => match std::fs::remove_file(&path) {
+            Ok(()) => println!("Removed {}; the built-in text is back.", path.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                println!("Nothing to remove; the built-in text was already in use.")
+            }
+            Err(error) => return Err(error.into()),
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+/// RELAY_EDITOR, then the usual VISUAL/EDITOR, then whatever the platform always has.
+/// A failure to launch is not an error worth aborting on: the path is printed, and
+/// editing the file by hand does the same job.
+fn open_in_editor(path: &std::path::Path) {
+    use std::process::Command;
+    let editor = ["RELAY_EDITOR", "VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_family = "windows") { "notepad".to_string() } else { "nano".to_string() }
+        });
+    println!("Opening {} in {editor} ...", path.display());
+    match Command::new(&editor).arg(path).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => println!("{editor} exited with {status}. The file is at {}", path.display()),
+        Err(error) => {
+            println!("Could not launch {editor} ({error}).");
+            println!("Edit this file by hand: {}", path.display());
+        }
+    }
+}
+
 fn display_menu() {
     println!("\n=== Codex Proxy Server===");
     println!("1. Run server");
@@ -281,7 +372,8 @@ fn display_menu() {
     println!("4. Refresh token");
     println!("5. Exit");
     println!("6. List running servers");
-    print!("Please select an option (1-6): ");
+    println!("7. Edit instructions");
+    print!("Please select an option (1-7): ");
     io::stdout().flush().unwrap();
 }
 

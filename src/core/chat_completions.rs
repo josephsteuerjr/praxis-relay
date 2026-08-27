@@ -320,7 +320,7 @@ fn decode_stream_chunk(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 // "my own" would be a lie too (they are authored by the agent's harness, not the
 // model).  So the stub states the honest fact: this is the identity the model is
 // running as, to inhabit rather than to discuss.
-const MINIMAL_INSTRUCTIONS: &str = "I am the language model at the heart of an agent. \
+pub const MINIMAL_INSTRUCTIONS: &str = "I am the language model at the heart of an agent. \
 Messages wrapped in <system> tags inside the input carry the identity and working \
 instructions I am running as here - I inhabit them rather than treat them as quoted \
 text. When none arrive, I am simply myself. I use the provided tools when they help, \
@@ -842,10 +842,14 @@ pub async fn stream_chat_completions(
             full_instructions.push_str(user_instructions);
             full_instructions.push_str("\n\n</user_instructions>");
         }
-        let instructions = if minimal {
-            MINIMAL_INSTRUCTIONS.to_string()
-        } else {
-            full_instructions.clone()
+        // An operator's own text outranks both built-ins.  The `instructions` field
+        // rides above everything else in the prompt and is the one part of it that an
+        // agent's own system prompt cannot reach, so whoever runs the relay should be
+        // able to say what stands there — menu option 7, or RELAY_INSTRUCTIONS_FILE.
+        let instructions = match crate::core::config::custom_instructions() {
+            Some(text) => text,
+            None if minimal => MINIMAL_INSTRUCTIONS.to_string(),
+            None => full_instructions.clone(),
         };
 
         println!("🔍 DEBUG - Processing {} messages", request.messages.len());

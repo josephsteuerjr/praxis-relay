@@ -49,6 +49,9 @@ Menu `3` logs the relay into your ChatGPT account (a browser opens; Python 3 is 
 for this step — `python.exe`, `py -3`, and `python3.exe` are discovered automatically, or
 set `RELAY_PYTHON`). Menu `1` starts the server. Check `http://127.0.0.1:5011/health`.
 
+Menu `7` shows the text the relay is currently sending above every request and opens
+it in an editor — see below for why that field is worth owning.
+
 Once the server is running the console hides into a **system tray icon**: double-click the
 icon to show or hide the window (with its live log), and quit from the tray menu. Adding a
 second subscription: run menu `3` again and answer `2` to the slot question — the existing
@@ -57,6 +60,29 @@ login migrates to slot `primary` automatically; restart the server to pick the n
 On Linux, `cargo run` behaves the same; the Dockerfile provides a container build. The
 process deliberately binds only to loopback — expose it through a reverse proxy only as an
 explicit deployment decision.
+
+## The instructions field, and why you get to write it
+
+Every request carries an `instructions` string that sits **above the entire
+conversation** — above your agent's own system prompt, which travels inside the input
+where it cannot reach this slot. Whatever stands there frames how the model reads
+everything after it, and it is sent on every single call.
+
+Codex fills that slot with ~5k tokens announcing that the model is a terminal coding
+assistant. For anything that is not Codex, that is both a per-call tax and a claim
+about identity that competes with the one you wrote. So the default is a ~60-word
+neutral stub instead, and the retry to the full preamble exists only for the case
+where upstream rejects the short form.
+
+The stub is deliberately generic, which means it is not right for anyone in
+particular. `instructions.txt` (menu `7`) hands the slot over: your words, at the top
+of every call, versioned in a file you own. It is read fresh per request, so tuning it
+is a loop rather than a deploy. Delete the file and the built-in text returns.
+
+Two practical notes. The field is part of the cached prefix, so changing it mid-session
+costs one cache miss — edit between conversations when that matters. And upstream
+validates this field: the built-ins are known-accepted, and if your text is refused the
+request retries once on the full preamble rather than failing.
 
 ## Endpoints
 
@@ -85,6 +111,12 @@ explicit deployment decision.
   prompt travels in the input either way) or `codex` (the full ~5k-token Codex-CLI
   preamble on every call). A rejected minimal request automatically retries with the
   full prompt.
+- `RELAY_INSTRUCTIONS_FILE` — path to a plain-text file whose contents replace the
+  instructions outright, outranking `RELAY_INSTRUCTIONS`. Unset, the relay reads
+  `instructions.txt` next to the executable. Re-read per request, so an edit lands on
+  the next call with no restart; a missing or blank file just means "no override".
+- `RELAY_EDITOR` — editor for menu `7` (falls back to `VISUAL`, `EDITOR`, then
+  `notepad` on Windows and `nano` elsewhere).
 - `RELAY_PARALLEL_TOOL_CALLS` — `true` (default) or `false`.
 - `RELAY_ACCOUNT_COOLDOWN_SECONDS` — how long an exhausted subscription slot stays parked.
 - `RELAY_LOG_DIR` — log directory, default `logs` under the working directory.

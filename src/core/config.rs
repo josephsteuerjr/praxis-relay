@@ -1,6 +1,51 @@
 use std::path::{Path, PathBuf};
 
 pub const RELAY_AUTH_DIR_ENV_VAR: &str = "RELAY_AUTH_DIR";
+pub const RELAY_INSTRUCTIONS_FILE_ENV_VAR: &str = "RELAY_INSTRUCTIONS_FILE";
+pub const DEFAULT_INSTRUCTIONS_FILE: &str = "instructions.txt";
+
+/// Where the operator's own instructions text lives.
+///
+/// `RELAY_INSTRUCTIONS_FILE` wins when set; otherwise `instructions.txt` sits next
+/// to the executable, the same place `local_auth/` already occupies, so a relay
+/// stays one directory rather than a binary plus scattered state.  The bare
+/// filename is the last resort so `cargo run` still behaves.
+pub fn instructions_file_path() -> PathBuf {
+    if let Some(value) = std::env::var_os(RELAY_INSTRUCTIONS_FILE_ENV_VAR) {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(DEFAULT_INSTRUCTIONS_FILE)))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_INSTRUCTIONS_FILE))
+}
+
+/// The operator's instructions, if they wrote any.
+///
+/// Read per request rather than once at startup.  Editing the text is the whole
+/// point of the file, and an edit that needed a restart to land would be made far
+/// less often; one small local read beside an HTTPS round trip costs nothing
+/// measurable.
+///
+/// A missing, unreadable, or blank file is not an error.  It means "no override",
+/// and the built-in stub answers instead — so a typo in a path degrades to today's
+/// behavior rather than to an empty instructions field upstream.
+pub fn custom_instructions() -> Option<String> {
+    read_instructions(&instructions_file_path())
+}
+
+fn read_instructions(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -140,6 +185,29 @@ fn default_relay_auth_dir(executable: &Path) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_written_file_replaces_the_built_in_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instructions.txt");
+        std::fs::write(&path, "  I am someone else entirely.\n\n").unwrap();
+        assert_eq!(
+            read_instructions(&path).as_deref(),
+            Some("I am someone else entirely."),
+            "surrounding whitespace would shift the cached prefix for no reason"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_missing_file_means_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let blank = dir.path().join("instructions.txt");
+        std::fs::write(&blank, "   \n\t\n").unwrap();
+        assert_eq!(read_instructions(&blank), None,
+                   "a blank file must fall back, not send empty instructions upstream");
+        assert_eq!(read_instructions(&dir.path().join("absent.txt")), None,
+                   "a wrong path must degrade to the built-in stub, not fail the request");
+    }
 
     #[test]
     fn default_auth_dir_is_next_to_executable() {
