@@ -19,14 +19,12 @@ mod login;
 #[cfg(target_family = "windows")]
 mod tray;
 
-use core::chat_completions;
 use core::account_router::AccountRouter;
+use core::catalog::ModelCatalog;
+use core::chat_completions;
 use core::config::Config;
 use core::limits::LimitsCache;
-use core::models::{
-    is_supported_model, supported_model_list, ChatRequest, ModelList, MAX_CHAT_REQUEST_BYTES,
-    SUPPORTED_MODELS,
-};
+use core::models::{ChatRequest, ModelList, MAX_CHAT_REQUEST_BYTES};
 use login::lib::CodexAuth;
 
 // For CLI menu
@@ -43,6 +41,9 @@ struct AppState {
     config: Arc<Config>,
     accounts: AccountRouter,
     limits: LimitsCache,
+    // What the backend serves today, refreshed on a TTL; /v1/models and the
+    // request validator both read it (core::catalog).
+    catalog: ModelCatalog,
     // One pooled client for every upstream call: Client::new() per request cost a
     // fresh DNS+TCP+TLS handshake to chatgpt.com on every single LLM call.
     client: reqwest::Client,
@@ -425,6 +426,7 @@ async fn run_server() -> anyhow::Result<()> {
         config,
         accounts,
         limits: LimitsCache::default(),
+        catalog: ModelCatalog::from_env(),
         client,
     };
 
@@ -722,17 +724,23 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "account_router": {
             "active_slot": state.accounts.active_slot().await,
             "configured_slots": state.accounts.account_count(),
-        }
+        },
+        "model_catalog": state.catalog.status().await,
+        "codex_client_version": chat_completions::codex_cli_version(),
     });
     info!("✅ Health check response: {}", response);
     Json(response)
 }
 
-async fn models_handler(State(_state): State<AppState>) -> Json<ModelList> {
+async fn models_handler(State(state): State<AppState>) -> Json<ModelList> {
     info!("📋 Models endpoint requested");
-    // Built from core::models::SUPPORTED_MODELS — the single source of truth also
-    // used by the request validator below, so the two can never disagree.
-    let list = supported_model_list();
+    // The backend's own catalog (core::catalog), the same snapshot the request
+    // validator below reads, so the advertised set cannot drift from the
+    // accepted set. Static FALLBACK_MODELS only when the backend cannot be asked.
+    let list = state
+        .catalog
+        .model_list(&state.accounts, &state.client)
+        .await;
     info!("✅ Returning {} available models", list.data.len());
     Json(list)
 }
@@ -989,29 +997,72 @@ async fn chat_completions_handler(
     }
 
     info!("🚀 CHAT COMPLETIONS REQUEST RECEIVED!");
-    info!(
-        "Request model supported: {}",
-        is_supported_model(&request.model)
-    );
     info!("Request messages count: {}", request.messages.len());
     info!("Request tools count: {}", request.tools.len());
     info!("Request image parts count: {}", request.image_part_count());
 
-    // Validate model against the single source of truth (core::models::SUPPORTED_MODELS),
-    // not a prefix — the old starts_with("gpt-5") let bogus slugs through and would
-    // reject future models. The 404 message lists the real supported set.
-    if !is_supported_model(&request.model) {
+    // Validate the model against the backend's live catalog (core::catalog), not
+    // a constant and not a prefix: a slug the cached catalog does not know
+    // triggers one early refresh, so a model released after the last fetch is
+    // accepted on first ask; a typo is still refused loudly here, and the 404
+    // lists what is actually on offer right now.
+    let model_known = state
+        .catalog
+        .is_known(&request.model, &state.accounts, &state.client)
+        .await;
+    info!("Request model supported: {}", model_known);
+    if !model_known {
         warn!("Invalid model requested (value redacted)");
+        let snapshot = state
+            .catalog
+            .snapshot(&state.accounts, &state.client)
+            .await;
         return Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": {
-                    "message": format!("Model not found. Supported models: {}. Requested: {}", SUPPORTED_MODELS.join(", "), request.model),
+                    "message": format!(
+                        "Model not found. Available models ({}): {}. Requested: {}",
+                        snapshot.source.as_str(),
+                        snapshot.listed_slugs().join(", "),
+                        request.model
+                    ),
                     "type": "model_not_found",
                     "code": "model_not_found"
                 }
             }))
         ).into_response());
+    }
+
+    // Reasoning effort: the catalog says which levels this model takes.
+    // gpt-6-astra refuses "none"/"minimal" with a 400, which used to cost a
+    // failed call plus a conservative retry carrying the full Codex preamble
+    // (~5k prompt tokens per turn). Clamp to the nearest level the model
+    // supports before anything goes upstream; models the catalog knows no
+    // levels for are left exactly as before.
+    let snapshot = state
+        .catalog
+        .snapshot(&state.accounts, &state.client)
+        .await;
+    if let Some(entry) = snapshot.find(&request.model) {
+        let wanted = request
+            .reasoning_effort
+            .clone()
+            .or_else(|| state.config.reasoning_effort.clone());
+        let clamped = core::catalog::clamp_effort(
+            wanted.as_deref(),
+            &entry.reasoning_efforts,
+            entry.default_reasoning_effort.as_deref(),
+        );
+        if clamped != wanted {
+            info!(
+                "reasoning effort {:?} -> {:?} for {} (model takes {:?})",
+                wanted, clamped, request.model, entry.reasoning_efforts
+            );
+        }
+        if wanted.is_some() {
+            request.reasoning_effort = clamped;
+        }
     }
 
     if let Err(validation_error) = request.validate_content() {

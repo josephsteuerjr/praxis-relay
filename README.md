@@ -89,14 +89,40 @@ request retries once on the full preamble rather than failing.
 - `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions,
   streaming (SSE) when the request carries `"stream": true`, a single aggregated
   `chat.completion` JSON object otherwise. Tool calls and image input are supported.
-- `GET /v1/models` (alias: `GET /models`) — the supported model list
-  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-  `gpt-5.3-codex-spark`) with advertised context
-  metadata.
+- `GET /v1/models` (alias: `GET /models`) — the models the backend serves this
+  subscription right now, read from its own catalog (see below): today
+  `gpt-6-astra`, `gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
+  `gpt-5.3-codex-spark`, each with its context window, input modalities and
+  reasoning levels.
 - `GET /v1/limits` — remaining subscription quota as reported by the backend.
 - `GET /v1/account` / `POST /v1/account/switch` — inspect and deliberately switch the
   active subscription slot (see multi-account below).
-- `GET /health` — liveness plus the account-router state.
+- `GET /health` — liveness, the account-router state, where the model catalog came
+  from (`live` / `stale` / `fallback` / `static`) and the Codex client version presented.
+
+## The model list is the backend's, not ours
+
+The relay used to carry the model slugs as a constant, edited by hand each time OpenAI
+shipped one — a rebuild and a redeploy for a fact the backend already publishes. It
+now asks the backend (`GET backend-api/codex/models?client_version=…`, the same call
+Codex itself makes) once every `RELAY_MODELS_TTL` seconds and serves `/v1/models` from
+the answer. A request for a slug the cached answer does not know forces one early
+refresh, so a model released an hour ago works the moment someone asks for it; a typo
+is still a loud 404 that lists what is on offer. When the backend cannot be asked, the
+last good answer keeps serving, and with no answer ever a built-in list stands in —
+`/health` says which.
+
+Two things the catalog taught this relay, both measured live on 2026-09-04:
+
+- The backend gates the list on the **client version** it sees. `gpt-6-astra` carries
+  `minimal_client_version: 0.153.0`; the relay now presents the newest released Codex
+  CLI (0.153.3) and `RELAY_CODEX_VERSION` overrides it when the next model hides behind
+  a newer one.
+- Models differ in the **reasoning levels** they accept. `gpt-6-astra` answers
+  `400 unsupported_value` to `reasoning.effort: "none"` (its levels are low..max),
+  which used to cost a failed call plus a retry carrying the full 5k-token Codex
+  preamble. The relay now clamps the effort to the nearest level the model takes
+  before sending; a model the catalog lists no levels for is left untouched.
 
 ## Codex-Spark, and the quota nobody is spending
 
@@ -110,15 +136,23 @@ shorter. Two such calls consumed about 4% of the five-hour window, so the bucket
 is separate, not bottomless.
 
 The trade is real: it is text-only (no image input), its context is 128k rather
-than the 400k the other models advertise, and it is tuned for code rather than
+than the 272k the other models report, and it is tuned for code rather than
 conversation. Treat it as a fast lane, not a default.
 
 ## Configuration (environment variables)
 
 - `RELAY_PORT` — listen port, default `5011` (always loopback-only).
 - `RELAY_DEFAULT_MODEL` — what the `local-model` alias resolves to, default `gpt-5.4`.
-- `RELAY_CONTEXT_LENGTH` — context window advertised in `/v1/models`, default `400000`
-  (advisory metadata for clients; the real limit is enforced upstream).
+- `RELAY_CONTEXT_LENGTH` — overrides the context window advertised in `/v1/models`.
+  By default each model carries the number the backend reports for it (272000 today);
+  `400000` stands in for slugs the catalog does not describe. Advisory metadata for
+  clients; the real limit is enforced upstream.
+- `RELAY_CODEX_VERSION` — the Codex CLI version presented upstream, default `0.153.3`.
+  The backend lists a new model only to clients at or above its minimal version.
+- `RELAY_MODELS_TTL` — seconds between model-catalog refreshes, default `600`.
+- `RELAY_EXTRA_MODELS` — comma-separated slugs accepted and advertised on top of the
+  catalog (a slug the backend hides, or one it lists only for a newer client).
+- `RELAY_MODEL_DISCOVERY` — `off` serves the built-in list only and never asks the backend.
 - `RELAY_AUTH_DIR` — credential directory, default `local_auth` next to the executable.
 - `RELAY_PYTHON` — explicit Python 3 interpreter for the login helper.
 - `RELAY_REASONING_EFFORT` — default reasoning effort applied when a request carries none
@@ -165,7 +199,7 @@ The relay can stand in for a llama.cpp-style localhost server, so agent framewor
   asking the endpoint no longer see 0.
 - The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
   which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
-  still a strict-list 404, so typos in real model names keep failing loudly.
+  still a 404 against the live catalog, so typos in real model names keep failing loudly.
 - Requests without `"stream": true` get a single aggregated JSON response.
 - `tool_choice` travels through — `"required"`, `"none"`, and named-function forms included
   (the Chat-Completions `{"type":"function","function":{"name":…}}` shape is reshaped for

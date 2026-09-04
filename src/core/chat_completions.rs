@@ -17,11 +17,48 @@ use crate::core::models::{
 const MAX_VISIBLE_CITATIONS: usize = 12;
 const MAX_UPSTREAM_ERROR_CHARS: usize = 500;
 const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_CLI_VERSION: &str = "0.144.0";
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.0";
+/// The Codex CLI version this relay presents upstream unless `RELAY_CODEX_VERSION`
+/// says otherwise.
+///
+/// The backend gates its model catalog on the client version it sees: 5.6 became
+/// visible at 0.144.0, gpt-6-astra carries `minimal_client_version: 0.153.0`.
+/// The default tracks the newest released Codex CLI at the time of writing
+/// (0.153.3, 2026-09-04) so the catalog lists everything the subscription can
+/// use; when the next model hides behind a newer client, the fix is one line of
+/// environment, not a rebuild.
+const CODEX_CLI_VERSION_DEFAULT: &str = "0.153.3";
+pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+pub const RELAY_CODEX_VERSION_ENV: &str = "RELAY_CODEX_VERSION";
+static CODEX_CLI_VERSION_CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static CODEX_USER_AGENT_CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `RELAY_CODEX_VERSION` when set and non-blank, else the built-in default.
+/// Read once per process: the value rides in every upstream header.
+pub fn codex_cli_version() -> &'static str {
+    CODEX_CLI_VERSION_CELL.get_or_init(|| {
+        std::env::var(RELAY_CODEX_VERSION_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .unwrap_or_else(|| CODEX_CLI_VERSION_DEFAULT.to_string())
+    })
+}
+
+/// The full `User-Agent` value, derived from the version above so the two can
+/// never disagree -- they used to be two independent literals in two files.
+pub fn codex_user_agent() -> &'static str {
+    CODEX_USER_AGENT_CELL
+        .get_or_init(|| format!("{}/{}", CODEX_ORIGINATOR, codex_cli_version()))
+}
+
 // Efforts the Responses API can accept; anything else is dropped rather than sent.
-const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+// `max` and `ultra` are the levels the catalog lists for the 5.6 family and
+// gpt-6-astra beyond xhigh; which model takes which is the backend's call.
+// The order is the ladder `core::catalog::clamp_effort` walks when a model
+// refuses a level (astra takes nothing below `low`).
+pub(crate) const REASONING_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ТЕРМИНАЛЫ: чем именно кончился ход — машинным именем, а не английской прозой.
@@ -809,7 +846,7 @@ fn build_codex_request(
         .header("OpenAI-Beta", "responses=experimental")
         .header("session_id", session_id)
         .header("originator", CODEX_ORIGINATOR)
-        .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
+        .header(reqwest::header::USER_AGENT, codex_user_agent())
         .json(payload)
 }
 
@@ -914,7 +951,8 @@ pub async fn stream_chat_completions(
         // Try the exact URL that working codex uses: base + codex + responses
         println!(
             "🌐 Making request to ChatGPT Responses API: {} (client {})",
-            CHATGPT_CODEX_RESPONSES_URL, CODEX_CLI_VERSION
+            CHATGPT_CODEX_RESPONSES_URL,
+            codex_cli_version()
         );
 
         // CRITICAL: Use exact headers for ChatGPT Plus plan.  The session id is the
@@ -2836,12 +2874,18 @@ mod tests {
         .build()
         .unwrap();
 
-        assert_eq!(CODEX_USER_AGENT, "codex_cli_rs/0.144.0");
-        assert_eq!(CODEX_CLI_VERSION, "0.144.0");
+        // The default is pinned: it is the version at which the catalog lists
+        // gpt-6-astra, and it changes only on purpose. The header is derived from
+        // the version, never a second literal.
+        assert_eq!(CODEX_CLI_VERSION_DEFAULT, "0.153.3");
+        assert_eq!(
+            codex_user_agent(),
+            format!("codex_cli_rs/{}", codex_cli_version()).as_str()
+        );
         assert_eq!(request.url().as_str(), CHATGPT_CODEX_RESPONSES_URL);
         assert_eq!(
             request.headers().get(reqwest::header::USER_AGENT).unwrap(),
-            CODEX_USER_AGENT
+            codex_user_agent()
         );
         assert_eq!(
             request.headers().get("originator").unwrap(),

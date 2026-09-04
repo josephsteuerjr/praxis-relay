@@ -4,16 +4,21 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// Single source of truth for the model slugs this relay advertises and accepts.
+/// The static safety net: what the relay serves when the backend's own model
+/// catalog cannot be read (see `core::catalog`).
 ///
-/// Both `/v1/models` (via [`supported_model_list`]) and `/v1/chat/completions`
-/// (via [`is_supported_model`]) derive from this one list, so the advertised set
-/// can never drift from the accepted set. Add a model here and both endpoints
-/// follow — no more editing three unrelated places (the drift bug this pass fixes).
-// Codex backend 0.144.0 exposes 5.6 as three explicit, User-Agent-gated
-// variants. Keep the generic `gpt-5.6` alias out: the isolated canary rejects
-// it even when these three identifiers succeed.
-pub const SUPPORTED_MODELS: &[&str] = &[
+/// This is no longer the source of truth. `/v1/models` and the request
+/// validator both read the live catalog (`GET backend-api/codex/models`), which
+/// is why a model released tomorrow needs no edit here. The list still matters
+/// for the first request after a cold start with the backend unreachable, so
+/// keep it honest: real slugs the backend serves today, nothing speculative.
+// Codex backend exposes 5.6 as three explicit variants. Keep the generic
+// `gpt-5.6` alias out: the isolated canary rejects it even when these three
+// identifiers succeed -- and the bare `gpt-6` alias stays out by the same
+// reasoning. `gpt-6-astra` (2026-09-03) is served with a client version >=
+// 0.153.0 and is the identifier OpenAI published.
+pub const FALLBACK_MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -48,13 +53,15 @@ pub const MAX_REMOTE_IMAGE_URL_BYTES: usize = 16 * 1024;
 pub const MAX_DATA_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_WEB_SEARCH_USES: u32 = 10;
 
-/// True if `model` is exactly one of the models this relay supports.
+/// True if `model` is exactly one of the static fallback models.
 ///
-/// Replaces the old `starts_with("gpt-5")` prefix check, which both let bogus
-/// slugs like `"gpt-5-nope"` through (failing later with a confusing error) and
-/// would reject any future model not literally prefixed `gpt-5`.
-pub fn is_supported_model(model: &str) -> bool {
-    SUPPORTED_MODELS.contains(&model)
+/// Exact match, not a prefix: the old `starts_with("gpt-5")` check both let
+/// bogus slugs like `"gpt-5-nope"` through (failing later with a confusing
+/// error) and would have rejected every future model not prefixed `gpt-5`.
+/// Live validation goes through `core::catalog`; this is what it degrades to.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_fallback_model(model: &str) -> bool {
+    FALLBACK_MODELS.contains(&model)
 }
 
 /// The model slug that llama.cpp-style clients hardcode.  llama-cpp-python
@@ -66,54 +73,31 @@ pub fn is_supported_model(model: &str) -> bool {
 /// so typos in real model names still fail loudly.
 pub const LOCAL_MODEL_ALIAS: &str = "local-model";
 
-/// Advertised context window, in tokens.  Advisory metadata for clients that
-/// size their history by asking the endpoint (Ouroboros reads
-/// `meta.n_ctx_train`, then `context_window`, and treats 0 as "tiny model":
-/// output capped and history compacted to fit ~4k).  The real limit is
-/// enforced upstream per model and plan; RELAY_CONTEXT_LENGTH overrides the
-/// advertised number if it proves wrong for a given account.
+/// Advertised context window, in tokens, when nothing better is known.
+/// Advisory metadata for clients that size their history by asking the
+/// endpoint (Ouroboros reads `meta.n_ctx_train`, then `context_window`, and
+/// treats 0 as "tiny model": output capped and history compacted to fit ~4k).
+/// The backend's catalog reports the real window per model (272k today) and
+/// wins when available; RELAY_CONTEXT_LENGTH overrides both if the number
+/// proves wrong for a given account; this default answers for the fallback
+/// list and for extra slugs the catalog does not describe.
 pub const DEFAULT_ADVERTISED_CONTEXT_LENGTH: u32 = 400_000;
 
 /// Advertised output ceiling, advisory in the same way.
 pub const DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
-pub fn advertised_context_length() -> u32 {
+/// `RELAY_CONTEXT_LENGTH` when set to a positive number: the operator's word
+/// over the catalog's.
+pub fn context_length_override() -> Option<u32> {
     std::env::var("RELAY_CONTEXT_LENGTH")
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_ADVERTISED_CONTEXT_LENGTH)
 }
 
-/// Build the `/v1/models` payload from [`SUPPORTED_MODELS`] so the advertised
-/// list is generated from the same constant the request validator checks against.
-///
-/// Each entry carries the context window under every field name the common
-/// localhost clients actually read: `meta.n_ctx_train` (llama-cpp-python — the
-/// primary key Ouroboros checks), `context_window` (its fallback), and
-/// `context_length` (LM Studio/OpenRouter convention).  Plain OpenAI clients
-/// ignore unknown fields, so the extras cost nothing.
-pub fn supported_model_list() -> ModelList {
-    let created = chrono::Utc::now().timestamp();
-    let context_length = advertised_context_length();
-    ModelList {
-        object: "list".to_string(),
-        data: SUPPORTED_MODELS
-            .iter()
-            .map(|id| Model {
-                id: (*id).to_string(),
-                object: "model".to_string(),
-                created,
-                owned_by: "chatgpt".to_string(),
-                context_window: context_length,
-                context_length,
-                max_output_tokens: DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS,
-                meta: ModelMeta {
-                    n_ctx_train: context_length,
-                },
-            })
-            .collect(),
-    }
+/// The context window to advertise when the catalog has none for a model.
+pub fn advertised_context_length() -> u32 {
+    context_length_override().unwrap_or(DEFAULT_ADVERTISED_CONTEXT_LENGTH)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +521,21 @@ pub struct Model {
     pub context_length: u32,
     pub max_output_tokens: u32,
     pub meta: ModelMeta,
+    // Everything below comes from the backend's catalog and is omitted when
+    // unknown, so a bare entry carries exactly the fields it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
+    /// The slug the backend suggests instead, when it marks this one superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,12 +632,16 @@ mod tests {
     }
 
     #[test]
-    fn valid_models_are_accepted() {
-        // Every advertised model must pass the request validator.
-        for m in SUPPORTED_MODELS {
-            assert!(is_supported_model(m), "{m} should be supported");
+    fn fallback_models_are_accepted_by_the_fallback_check() {
+        for m in FALLBACK_MODELS {
+            assert!(is_fallback_model(m), "{m} should be supported");
         }
-        assert!(!is_supported_model("gpt-5.6"));
+        // The identifier OpenAI published; a rename upstream must fail here first.
+        assert!(is_fallback_model("gpt-6-astra"));
+        // The bare aliases stay rejected: the backend rejects them, and letting
+        // them in only moves the failure somewhere more confusing.
+        assert!(!is_fallback_model("gpt-5.6"));
+        assert!(!is_fallback_model("gpt-6"));
     }
 
     #[test]
@@ -653,29 +656,49 @@ mod tests {
             "",
             "GPT-5.4",
         ] {
-            assert!(!is_supported_model(m), "{m:?} should NOT be supported");
+            assert!(!is_fallback_model(m), "{m:?} should NOT be supported");
         }
     }
 
     #[test]
-    fn models_endpoint_matches_supported_list() {
-        // /v1/models must return exactly SUPPORTED_MODELS, in order — the
-        // guard against the advertised list drifting from the accepted list.
-        let list = supported_model_list();
-        assert_eq!(list.object, "list");
-        let ids: Vec<&str> = list.data.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, SUPPORTED_MODELS.to_vec());
-        for m in &list.data {
-            assert_eq!(m.object, "model");
-            assert_eq!(m.owned_by, "chatgpt");
-            // The Ouroboros local lane reads meta.n_ctx_train (then
-            // context_window) and treats 0 as a tiny model: output capped,
-            // history compacted to nothing.  Never advertise 0.
-            assert!(m.meta.n_ctx_train > 0);
-            assert_eq!(m.context_window, m.meta.n_ctx_train);
-            assert_eq!(m.context_length, m.meta.n_ctx_train);
-            assert!(m.max_output_tokens > 0);
-        }
+    fn a_bare_model_entry_keeps_the_pre_catalog_shape() {
+        // The four OpenAI fields plus the three context spellings and the output
+        // ceiling: exactly what 0.6.0 served, so old clients see nothing new.
+        let bare = Model {
+            id: "gpt-6-astra".to_string(),
+            object: "model".to_string(),
+            created: 1,
+            owned_by: "chatgpt".to_string(),
+            context_window: 400_000,
+            context_length: 400_000,
+            max_output_tokens: 128_000,
+            meta: ModelMeta {
+                n_ctx_train: 400_000,
+            },
+            display_name: None,
+            max_context_window: None,
+            input_modalities: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            upgrade: None,
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["context_length", "context_window", "created", "id", "max_output_tokens", "meta", "object", "owned_by"]
+        );
+        // And the 0.6.0 document still deserializes.
+        let list: ModelList = serde_json::from_value(json!({
+            "object": "list",
+            "data": [{"id": "gpt-5.5", "object": "model", "created": 1, "owned_by": "chatgpt",
+                      "context_window": 1, "context_length": 1, "max_output_tokens": 1,
+                      "meta": {"n_ctx_train": 1}}]
+        }))
+        .unwrap();
+        assert_eq!(list.data[0].id, "gpt-5.5");
+        assert!(list.data[0].input_modalities.is_empty());
     }
 
     #[test]
