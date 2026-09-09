@@ -4,10 +4,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use std::env;
-use std::ffi::OsString;
-use std::fs::File;
 use std::fs;
 use std::fs::remove_file;
+use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::io::{self};
@@ -23,75 +22,12 @@ use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::process::Command;
 
-pub use crate::login::token_data::TokenData;
 use crate::login::token_data::parse_id_token;
+pub use crate::login::token_data::TokenData;
 
 const SOURCE_FOR_PYTHON_SERVER: &str = include_str!("./login_with_chatgpt.py");
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-
-/// A Python 3 interpreter invocation: the program plus its fixed leading args.
-#[derive(Clone, Debug)]
-struct PythonLauncher {
-    program: OsString,
-    args: Vec<OsString>,
-}
-
-impl PythonLauncher {
-    fn new(program: impl Into<OsString>, args: &[&str]) -> Self {
-        Self {
-            program: program.into(),
-            args: args.iter().map(OsString::from).collect(),
-        }
-    }
-}
-
-fn python_candidates() -> Vec<PythonLauncher> {
-    let mut candidates = Vec::new();
-
-    if let Some(program) = env::var_os("RELAY_PYTHON").filter(|value| !value.is_empty()) {
-        candidates.push(PythonLauncher::new(program, &[]));
-    }
-
-    // Windows installs rarely ship a `python3.exe`: the python.org installer
-    // provides `python.exe` and the `py` launcher, and the Microsoft Store
-    // alias named python3.exe just opens the Store when Python is absent.
-    #[cfg(target_family = "windows")]
-    candidates.extend([
-        PythonLauncher::new("python", &[]),
-        PythonLauncher::new("py", &["-3"]),
-        PythonLauncher::new("python3", &[]),
-    ]);
-
-    #[cfg(not(target_family = "windows"))]
-    candidates.extend([
-        PythonLauncher::new("python3", &[]),
-        PythonLauncher::new("python", &[]),
-    ]);
-
-    candidates
-}
-
-fn find_python_launcher() -> io::Result<PythonLauncher> {
-    for candidate in python_candidates() {
-        let status = std::process::Command::new(&candidate.program)
-            .args(&candidate.args)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        if status.is_ok_and(|status| status.success()) {
-            return Ok(candidate);
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "Python 3 was not found; install Python or set RELAY_PYTHON to the interpreter path",
-    ))
-}
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 
 #[derive(Clone, Debug, PartialEq, Copy)]
@@ -104,6 +40,9 @@ pub enum AuthMode {
 pub struct CodexAuth {
     pub mode: AuthMode,
 
+    // Retained for the legacy API-key client API (`get_token`), which is not
+    // used by the subscription-only relay binary.
+    #[allow(dead_code)]
     api_key: Option<String>,
     auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
     auth_file: PathBuf,
@@ -128,15 +67,6 @@ impl CodexAuth {
     /// Loads the available auth information for Codex Proxy Server from the auth.json file (in ~/.codex, ~/.opencode, or ./local_auth) or from the OPENAI_API_KEY environment variable. This supports both Codex Proxy Server and Opencode integration.
     pub fn from_codex_home(codex_home: &Path) -> std::io::Result<Option<CodexAuth>> {
         load_auth(codex_home, true)
-    }
-
-    /// Loads only the relay's dedicated auth.json. This deliberately ignores
-    /// the OPENAI_API_KEY environment variable so accounts cannot mix.
-    pub fn from_auth_dir(auth_dir: &Path) -> std::io::Result<Option<CodexAuth>> {
-        match load_auth(auth_dir, false) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            result => result,
-        }
     }
 
     pub async fn get_token_data(&self) -> Result<TokenData, std::io::Error> {
@@ -194,6 +124,7 @@ impl CodexAuth {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn get_token(&self) -> Result<String, std::io::Error> {
         match self.mode {
             AuthMode::ApiKey => Ok(self.api_key.clone().unwrap_or_default()),
@@ -205,11 +136,13 @@ impl CodexAuth {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_account_id(&self) -> Option<String> {
         self.get_current_token_data()
             .and_then(|t| t.account_id.clone())
     }
 
+    #[allow(dead_code)]
     pub fn get_plan_type(&self) -> Option<String> {
         self.get_current_token_data()
             .and_then(|t| t.id_token.chatgpt_plan_type.as_ref().map(|p| p.as_string()))
@@ -220,11 +153,13 @@ impl CodexAuth {
         self.auth_dot_json.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     fn get_current_token_data(&self) -> Option<TokenData> {
         self.get_current_auth_json().and_then(|t| t.tokens.clone())
     }
 
     /// Consider this private to integration tests.
+    #[allow(dead_code)]
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
         let auth_dot_json = AuthDotJson {
             openai_api_key: None,
@@ -325,6 +260,7 @@ pub fn get_auth_file(codex_home: &Path) -> PathBuf {
 
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
+#[allow(dead_code)]
 pub fn logout(codex_home: &Path) -> std::io::Result<bool> {
     let auth_file = get_auth_file(codex_home);
     match remove_file(&auth_file) {
@@ -337,6 +273,7 @@ pub fn logout(codex_home: &Path) -> std::io::Result<bool> {
 /// Represents a running login subprocess. The child can be killed by holding
 /// the mutex and calling `kill()`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SpawnedLogin {
     pub child: Arc<Mutex<Child>>,
     pub stdout: Arc<Mutex<Vec<u8>>>,
@@ -348,6 +285,7 @@ impl SpawnedLogin {
     ///
     /// The Python helper prints the URL to stderr; we capture it and extract
     /// the last whitespace-separated token that starts with "http".
+    #[allow(dead_code)]
     pub fn get_login_url(&self) -> Option<String> {
         self.stderr
             .lock()
@@ -356,14 +294,14 @@ impl SpawnedLogin {
             .and_then(|output| {
                 output
                     .split_whitespace()
-                    .filter(|part| part.starts_with("http"))
-                    .next_back()
+                    .rfind(|part| part.starts_with("http"))
                     .map(|s| s.to_string())
             })
     }
 }
 
 // Helpers for streaming child output into shared buffers
+#[allow(dead_code)]
 struct AppendWriter {
     buf: Arc<Mutex<Vec<u8>>>,
 }
@@ -381,6 +319,7 @@ impl Write for AppendWriter {
     }
 }
 
+#[allow(dead_code)]
 fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) {
     std::thread::spawn(move || {
         let _ = io::copy(&mut reader, &mut AppendWriter { buf });
@@ -388,12 +327,11 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec
 }
 
 /// Spawn the ChatGPT login Python server as a child process and return a handle to its process.
+#[allow(dead_code)]
 pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLogin> {
     let script_path = write_login_script_to_disk()?;
-    let launcher = find_python_launcher()?;
-    let mut cmd = std::process::Command::new(&launcher.program);
-    cmd.args(&launcher.args)
-        .arg(&script_path)
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
         .stdin(Stdio::null())
@@ -419,8 +357,8 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
     })
 }
 
-/// Run the bundled Python login helper with the CODEX_HOME environment
-/// variable set to the provided `codex_home` path. If the
+/// Run `python3 -c {{SOURCE_FOR_PYTHON_SERVER}}` with the CODEX_HOME
+/// environment variable set to the provided `codex_home` path. If the
 /// subprocess exits 0, read the OPENAI_API_KEY property out of
 /// CODEX_HOME/auth.json and return Ok(OPENAI_API_KEY). Otherwise, return Err
 /// with any information from the subprocess.
@@ -430,9 +368,7 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
 /// current process's stdout/stderr.
 pub async fn login_with_chatgpt(codex_home: &Path, capture_output: bool) -> std::io::Result<()> {
     let script_path = write_login_script_to_disk()?;
-    let launcher = find_python_launcher()?;
-    let child = Command::new(&launcher.program)
-        .args(&launcher.args)
+    let child = Command::new("python3")
         .arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
@@ -471,6 +407,7 @@ fn write_login_script_to_disk() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+#[allow(dead_code)]
 pub fn login_with_api_key(codex_home: &Path, api_key: &str) -> std::io::Result<()> {
     let auth_dot_json = AuthDotJson {
         openai_api_key: Some(api_key.to_string()),
@@ -924,7 +861,10 @@ mod tests {
             last_refresh: None,
         };
         assert!(write_auth_json(&auth_file, &auth_dot_json, None).is_err());
-        assert!(!auth_file.exists(), "отказ не должен оставлять огрызок файла");
+        assert!(
+            !auth_file.exists(),
+            "отказ не должен оставлять огрызок файла"
+        );
     }
 
     #[test]

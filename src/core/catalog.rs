@@ -31,10 +31,7 @@ use tracing::{info, warn};
 
 use crate::core::account_router::AccountRouter;
 use crate::core::chat_completions::{codex_cli_version, codex_user_agent, CODEX_ORIGINATOR};
-use crate::core::models::{
-    advertised_context_length, context_length_override, Model, ModelList, ModelMeta,
-    DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS, FALLBACK_MODELS,
-};
+use crate::core::models::{Model, ModelList, FALLBACK_MODELS};
 
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 pub const RELAY_MODELS_TTL_ENV: &str = "RELAY_MODELS_TTL";
@@ -170,10 +167,9 @@ impl ModelCatalog {
         Self::with(Vec::new(), ttl, discovery, extra)
     }
 
-    /// The static list only, never a network call: what
-    /// `RELAY_MODEL_DISCOVERY=off` deployments run on, and what a test that
-    /// must not touch the network constructs.
-    #[allow(dead_code)]
+    /// The static list only, never a network call: what tests and
+    /// `RELAY_MODEL_DISCOVERY=off` deployments run on.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn static_only() -> Self {
         Self::with(Vec::new(), DEFAULT_TTL, false, Vec::new())
     }
@@ -512,49 +508,32 @@ pub fn parse_catalog(raw: &Value) -> Result<Vec<CatalogModel>> {
 
 /// Build the OpenAI-shaped `/v1/models` document from a snapshot: listed models
 /// only, in priority order, with the backend's metadata beside the four
-/// standard fields.
-///
-/// The context window rides under every field name the common localhost
-/// clients read -- `meta.n_ctx_train` (llama-cpp-python, the key Ouroboros
-/// checks first), `context_window`, `context_length` (LM Studio/OpenRouter) --
-/// and is never 0: the backend's own number for the model when the catalog has
-/// it, `RELAY_CONTEXT_LENGTH` when the operator insists, the built-in default
-/// when neither is known (fallback list, extra slugs).
+/// standard fields. `meta.n_ctx_train` / `context_length` are the llama.cpp
+/// spellings that local-model client lanes read.
 pub fn model_list_from(snapshot: &CatalogSnapshot) -> ModelList {
     let created = chrono::Utc::now().timestamp();
-    let override_length = context_length_override();
     ModelList {
         object: "list".to_string(),
         data: snapshot
             .models
             .iter()
             .filter(|m| m.listed)
-            .map(|m| {
-                let context_length = override_length
-                    .or_else(|| {
-                        m.context_window
-                            .and_then(|window| u32::try_from(window).ok())
-                            .filter(|window| *window > 0)
-                    })
-                    .unwrap_or_else(advertised_context_length);
-                Model {
-                    id: m.slug.clone(),
-                    object: "model".to_string(),
-                    created,
-                    owned_by: "chatgpt".to_string(),
-                    context_window: context_length,
-                    context_length,
-                    max_output_tokens: DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS,
-                    meta: ModelMeta {
-                        n_ctx_train: context_length,
-                    },
-                    display_name: m.display_name.clone(),
-                    max_context_window: m.max_context_window,
-                    input_modalities: m.input_modalities.clone(),
-                    reasoning_efforts: m.reasoning_efforts.clone(),
-                    default_reasoning_effort: m.default_reasoning_effort.clone(),
-                    upgrade: m.upgrade.clone(),
-                }
+            .map(|m| Model {
+                id: m.slug.clone(),
+                object: "model".to_string(),
+                created,
+                owned_by: "chatgpt".to_string(),
+                display_name: m.display_name.clone(),
+                context_window: m.context_window,
+                context_length: m.context_window,
+                max_context_window: m.max_context_window,
+                meta: m
+                    .context_window
+                    .map(|window| json!({ "n_ctx_train": window })),
+                input_modalities: m.input_modalities.clone(),
+                reasoning_efforts: m.reasoning_efforts.clone(),
+                default_reasoning_effort: m.default_reasoning_effort.clone(),
+                upgrade: m.upgrade.clone(),
             })
             .collect(),
     }
@@ -634,24 +613,16 @@ mod tests {
         let astra = &list.data[0];
         assert_eq!(astra.object, "model");
         assert_eq!(astra.owned_by, "chatgpt");
-        // The backend's own window, under all three spellings, never 0.
-        assert_eq!(astra.context_window, 272000);
-        assert_eq!(astra.context_length, 272000);
-        assert_eq!(astra.meta.n_ctx_train, 272000);
-        assert!(astra.max_output_tokens > 0);
+        assert_eq!(astra.context_window, Some(272000));
+        assert_eq!(astra.context_length, Some(272000));
+        assert_eq!(astra.meta.as_ref().unwrap()["n_ctx_train"], 272000);
         assert_eq!(astra.input_modalities, ["text", "image"]);
-        // A bare entry (no window in the catalog) still advertises a real number.
-        let bare = &list.data[2];
-        assert_eq!(bare.meta.n_ctx_train, advertised_context_length());
-        assert!(bare.meta.n_ctx_train > 0);
-        assert_eq!(bare.context_window, bare.meta.n_ctx_train);
-        assert_eq!(bare.context_length, bare.meta.n_ctx_train);
         // Serialized shape: the four OpenAI fields always, metadata only when known.
         let value = serde_json::to_value(&list).unwrap();
         assert_eq!(value["data"][0]["id"], "gpt-6-astra");
         assert_eq!(value["data"][0]["display_name"], "GPT-6-Astra");
         assert!(value["data"][2].get("display_name").is_none());
-        assert!(value["data"][2]["meta"]["n_ctx_train"].as_u64().unwrap() > 0);
+        assert!(value["data"][2].get("meta").is_none());
         assert!(value["data"][2].get("input_modalities").is_none());
         assert_eq!(value["data"][2]["upgrade"], "gpt-5.6-terra");
         // Hidden slugs are still findable for validation.

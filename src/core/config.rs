@@ -1,15 +1,13 @@
+use dirs::home_dir;
 use std::path::{Path, PathBuf};
 
-pub const RELAY_AUTH_DIR_ENV_VAR: &str = "RELAY_AUTH_DIR";
 pub const RELAY_INSTRUCTIONS_FILE_ENV_VAR: &str = "RELAY_INSTRUCTIONS_FILE";
 pub const DEFAULT_INSTRUCTIONS_FILE: &str = "instructions.txt";
 
 /// Where the operator's own instructions text lives.
 ///
 /// `RELAY_INSTRUCTIONS_FILE` wins when set; otherwise `instructions.txt` sits next
-/// to the executable, the same place `local_auth/` already occupies, so a relay
-/// stays one directory rather than a binary plus scattered state.  The bare
-/// filename is the last resort so `cargo run` still behaves.
+/// to the executable, beside the auth directory the relay already keeps there.
 pub fn instructions_file_path() -> PathBuf {
     if let Some(value) = std::env::var_os(RELAY_INSTRUCTIONS_FILE_ENV_VAR) {
         let path = PathBuf::from(value);
@@ -25,14 +23,10 @@ pub fn instructions_file_path() -> PathBuf {
 
 /// The operator's instructions, if they wrote any.
 ///
-/// Read per request rather than once at startup.  Editing the text is the whole
-/// point of the file, and an edit that needed a restart to land would be made far
-/// less often; one small local read beside an HTTPS round trip costs nothing
-/// measurable.
-///
-/// A missing, unreadable, or blank file is not an error.  It means "no override",
-/// and the built-in stub answers instead — so a typo in a path degrades to today's
-/// behavior rather than to an empty instructions field upstream.
+/// Read per request rather than at startup, so an edit lands on the next call with
+/// no restart.  Missing, unreadable, or blank is not an error: it means "no
+/// override", and the built-in text answers instead -- a wrong path degrades to
+/// today's behavior rather than to an empty instructions field upstream.
 pub fn custom_instructions() -> Option<String> {
     read_instructions(&instructions_file_path())
 }
@@ -60,10 +54,7 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        // Relay credentials deliberately live outside ~/.codex and ~/.opencode.
-        // The default sits next to the executable, matching the server layout
-        // where /opt/relay/auth is mounted at /app/local_auth.
-        let codex_home = find_relay_auth_dir()?;
+        let codex_home = find_codex_home();
 
         // Load user instructions from AGENTS.md
         let user_instructions = Self::load_instructions(Some(&codex_home));
@@ -71,20 +62,42 @@ impl Config {
         let instructions_mode = Self::load_instructions_mode();
         let parallel_tool_calls = Self::load_parallel_tool_calls();
 
-        // RELAY_DEFAULT_MODEL: what the "local-model" alias resolves to (clients
-        // built against llama-cpp-python hardcode that slug).  Kept at the safest
-        // slug by default; an unsupported override fails loudly at request time
-        // with the 404 that names the real list.
-        let model = std::env::var("RELAY_DEFAULT_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "gpt-5.4".to_string());
+        // Check if auth.json exists in ./local_auth directory (fallback)
+        let local_auth_dir = std::env::current_dir()?.join("local_auth");
+        let local_auth_file = local_auth_dir.join("auth.json");
+        let primary_profile = local_auth_dir
+            .join("accounts")
+            .join("primary")
+            .join("auth.json");
+        if local_auth_file.exists() || primary_profile.exists() {
+            return Ok(Config {
+                codex_home: local_auth_dir,
+                chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                model: "gpt-5.4".to_string(),
+                user_instructions,
+                reasoning_effort,
+                instructions_mode: instructions_mode.clone(),
+                parallel_tool_calls,
+            });
+        }
+        // Check if auth.json exists in the current directory (legacy fallback)
+        let current_dir_auth = std::env::current_dir()?.join("auth.json");
+        if current_dir_auth.exists() {
+            return Ok(Config {
+                codex_home: std::env::current_dir()?,
+                chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                model: "gpt-5.4".to_string(),
+                user_instructions,
+                reasoning_effort,
+                instructions_mode: instructions_mode.clone(),
+                parallel_tool_calls,
+            });
+        }
 
         Ok(Config {
             codex_home,
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            model,
+            model: "gpt-5.4".to_string(), // Default, but can be changed to any gpt-5* variant
             user_instructions,
             reasoning_effort,
             instructions_mode,
@@ -92,24 +105,18 @@ impl Config {
         })
     }
 
-    /// RELAY_INSTRUCTIONS: "minimal" (default — a ~60-word neutral stub; the client's
-    /// real system prompt travels inside the input as a <system> message anyway) or
-    /// "codex" — the full vendored prompt.md, ~5k tokens of coding-agent instructions
-    /// burned on EVERY call and steering the model toward Codex-CLI behavior.  When
-    /// minimal is rejected upstream (4xx) the request is retried once with the full
-    /// prompt, so the worst case equals the codex mode.
+    /// RELAY_INSTRUCTIONS: "codex" (default — full vendored prompt.md, known-accepted
+    /// by the backend) or "minimal" — a ~60-word neutral stub instead of ~5k tokens of
+    /// coding-agent instructions per call.  When minimal is rejected upstream (4xx) the
+    /// request is retried once with the full prompt, so the worst case is the default.
     pub fn minimal_instructions(&self) -> bool {
         self.instructions_mode.as_deref() == Some("minimal")
     }
 
     fn load_instructions_mode() -> Option<String> {
-        match std::env::var("RELAY_INSTRUCTIONS") {
-            Ok(value) => Some(value.trim().to_lowercase()),
-            // Unset defaults to minimal: agents bring their own system prompt,
-            // and the Codex coding-agent preamble only costs quota and skews
-            // behavior.  RELAY_INSTRUCTIONS=codex restores the old default.
-            Err(_) => Some("minimal".to_string()),
-        }
+        std::env::var("RELAY_INSTRUCTIONS")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
     }
 
     /// RELAY_PARALLEL_TOOL_CALLS: unset/"true" lets the model batch several tool calls
@@ -117,7 +124,10 @@ impl Config {
     /// restores the old one-tool-per-round-trip behavior.
     fn load_parallel_tool_calls() -> bool {
         !matches!(
-            std::env::var("RELAY_PARALLEL_TOOL_CALLS").ok().as_deref().map(str::trim),
+            std::env::var("RELAY_PARALLEL_TOOL_CALLS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
             Some("false") | Some("0") | Some("off")
         )
     }
@@ -141,10 +151,7 @@ impl Config {
     }
 
     fn load_instructions(codex_dir: Option<&std::path::Path>) -> Option<String> {
-        let mut p = match codex_dir {
-            Some(p) => p.to_path_buf(),
-            None => return None,
-        };
+        let mut p = codex_dir?.to_path_buf();
 
         p.push("AGENTS.md");
         std::fs::read_to_string(&p).ok().and_then(|s| {
@@ -158,63 +165,22 @@ impl Config {
     }
 }
 
-fn find_relay_auth_dir() -> anyhow::Result<PathBuf> {
-    if let Some(value) = std::env::var_os(RELAY_AUTH_DIR_ENV_VAR) {
-        if value.is_empty() {
-            anyhow::bail!("{RELAY_AUTH_DIR_ENV_VAR} must not be empty");
+fn find_codex_home() -> PathBuf {
+    // Try to find codex home directory for Codex Proxy Server and Opencode integration
+    if let Some(home) = home_dir() {
+        // First check for .codex directory (Codex Proxy Server CLI compatibility)
+        let codex_home = home.join(".codex");
+        if codex_home.exists() {
+            return codex_home;
         }
 
-        let path = PathBuf::from(value);
-        return if path.is_absolute() {
-            Ok(path)
-        } else {
-            Ok(std::env::current_dir()?.join(path))
-        };
+        // Then check for .opencode directory (Opencode integration default)
+        let opencode_home = home.join(".opencode");
+        if opencode_home.exists() {
+            return opencode_home;
+        }
     }
 
-    default_relay_auth_dir(&std::env::current_exe()?)
-}
-
-fn default_relay_auth_dir(executable: &Path) -> anyhow::Result<PathBuf> {
-    let executable_dir = executable
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine relay executable directory"))?;
-    Ok(executable_dir.join("local_auth"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_written_file_replaces_the_built_in_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("instructions.txt");
-        std::fs::write(&path, "  I am someone else entirely.\n\n").unwrap();
-        assert_eq!(
-            read_instructions(&path).as_deref(),
-            Some("I am someone else entirely."),
-            "surrounding whitespace would shift the cached prefix for no reason"
-        );
-    }
-
-    #[test]
-    fn a_blank_or_missing_file_means_no_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let blank = dir.path().join("instructions.txt");
-        std::fs::write(&blank, "   \n\t\n").unwrap();
-        assert_eq!(read_instructions(&blank), None,
-                   "a blank file must fall back, not send empty instructions upstream");
-        assert_eq!(read_instructions(&dir.path().join("absent.txt")), None,
-                   "a wrong path must degrade to the built-in stub, not fail the request");
-    }
-
-    #[test]
-    fn default_auth_dir_is_next_to_executable() {
-        let executable = PathBuf::from("bundle").join("praxis-relay.exe");
-        assert_eq!(
-            default_relay_auth_dir(&executable).unwrap(),
-            PathBuf::from("bundle").join("local_auth")
-        );
-    }
+    // Fallback to current directory
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }

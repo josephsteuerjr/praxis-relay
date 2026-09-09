@@ -10,7 +10,6 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
-use tracing_appender;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Modules
@@ -29,12 +28,6 @@ use login::lib::CodexAuth;
 
 // For CLI menu
 use std::io::{self, Write};
-use std::sync::Mutex;
-use tokio::task::JoinHandle;
-
-// Global registry for server handles
-use once_cell::sync::Lazy;
-static SERVER_HANDLES: Lazy<Mutex<Vec<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 #[derive(Clone)]
 struct AppState {
@@ -140,11 +133,6 @@ async fn main() {
                     error!("Failed to list running servers: {}", e);
                 }
             }
-            "7" => {
-                if let Err(e) = edit_instructions() {
-                    error!("Editing instructions failed: {}", e);
-                }
-            }
             _ => {
                 println!("Invalid choice. Please try again.");
             }
@@ -154,215 +142,57 @@ async fn main() {
 
 async fn run_login() -> anyhow::Result<()> {
     info!("Starting login process");
-    // The relay logs in only to its own dedicated auth directory (local_auth
-    // next to the executable, or RELAY_AUTH_DIR) — never ~/.codex or ~/.opencode,
-    // so relay credentials cannot mix with a normal Codex install.
-    let config = Config::load()?;
-    let auth_root = config.codex_home;
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let codex_home = home_dir.join(".codex");
+    let opencode_home = home_dir.join(".opencode");
+    let codex_auth_path = codex_home.join("auth.json");
+    let opencode_auth_path = opencode_home.join("auth.json");
 
-    println!("Login into which subscription slot?");
-    println!("  [Enter] primary   — the main subscription");
-    println!("  2       secondary — a standby subscription for quota failover");
-    print!("Slot: ");
-    io::stdout().flush().unwrap();
-    let secondary = get_user_choice() == "2";
+    // Try to read or create in .codex first
+    std::fs::create_dir_all(&codex_home)?;
+    println!("Codex home directory: {:?}", codex_home);
+    println!("Expected auth file path: {:?}", codex_auth_path);
 
-    let accounts_root = auth_root.join("accounts");
-    let legacy_auth = auth_root.join("auth.json");
-    let auth_dir = if secondary {
-        // The account router reads either the single legacy auth.json OR the
-        // accounts/ layout — never both.  A second subscription therefore
-        // needs the layout; migrate an existing single login into primary
-        // instead of silently orphaning it.
-        let primary_dir = accounts_root.join("primary");
-        if legacy_auth.is_file() && !primary_dir.join("auth.json").is_file() {
-            std::fs::create_dir_all(&primary_dir)?;
-            std::fs::rename(&legacy_auth, primary_dir.join("auth.json"))?;
-            println!(
-                "Moved the existing login to {:?} (slot primary).",
-                primary_dir.join("auth.json")
-            );
-        }
-        accounts_root.join("secondary")
-    } else if accounts_root.join("primary").join("auth.json").is_file()
-        || accounts_root.join("secondary").join("auth.json").is_file()
-    {
-        // The layout already exists: a primary (re-)login belongs in its slot.
-        accounts_root.join("primary")
-    } else {
-        // Single-account install: keep the simple single-file layout.
-        auth_root.clone()
-    };
-
-    std::fs::create_dir_all(&auth_dir)?;
-    let auth_path = auth_dir.join("auth.json");
-    println!("Relay auth file: {:?}", auth_path);
-
-    // Success is defined by auth.json landing on disk, NOT by the login helper
-    // exiting: the helper's HTTP server only shuts itself down when the browser
-    // loads /success, and it kills itself on ANY unexpected request (a page
-    // refresh, even favicon.ico).  Waiting for the process therefore hung the
-    // menu after perfectly successful logins, and a refresh made a successful
-    // login look failed.  Watch the file, and stop the helper ourselves.
-    let modified_before = std::fs::metadata(&auth_path)
-        .and_then(|meta| meta.modified())
-        .ok();
-    let auth_written = |before: &Option<std::time::SystemTime>| {
-        let now = std::fs::metadata(&auth_path)
-            .and_then(|meta| meta.modified())
-            .ok();
-        now.is_some() && now != *before
-    };
-
-    let spawned = login::lib::spawn_login_with_chatgpt(&auth_dir)?;
-    println!("A browser window should open. Sign in to the ChatGPT account for this slot.");
-
-    let started = std::time::Instant::now();
-    let mut printed_url = false;
-    let outcome = loop {
-        if auth_written(&modified_before) {
-            break Ok(());
-        }
-        if !printed_url {
-            // get_login_url returns the last http token from the helper's
-            // stderr; early on that is its own "http://localhost:1455" banner.
-            // The real sign-in URL is the https:// one — wait for it.
-            if let Some(url) = spawned.get_login_url() {
-                if url.starts_with("https://") {
-                    println!("If the browser did not open, use this URL:\n\n{url}\n");
-                    printed_url = true;
-                }
+    let mut used_opencode = false;
+    let login_result = login::lib::login_with_chatgpt(&codex_home, false).await;
+    if login_result.is_err() || !codex_auth_path.exists() {
+        // If failed or file not created, try .opencode
+        println!("Could not create or find auth.json in .codex, switching to .opencode directory (Opencode integration)...");
+        std::fs::create_dir_all(&opencode_home)?;
+        let login_result2 = login::lib::login_with_chatgpt(&opencode_home, false).await;
+        if login_result2.is_err() || !opencode_auth_path.exists() {
+            // Third fallback: create ./local_auth directory in current working directory
+            let local_auth_dir = std::env::current_dir()?.join("local_auth");
+            std::fs::create_dir_all(&local_auth_dir)?;
+            let local_auth_path = local_auth_dir.join("auth.json");
+            println!("Could not create or find auth.json in .codex or .opencode, switching to ./local_auth directory (local fallback)...");
+            let login_result3 = login::lib::login_with_chatgpt(&local_auth_dir, false).await;
+            if login_result3.is_err() || !local_auth_path.exists() {
+                return Err(anyhow::anyhow!("Login failed: Could not create auth.json in .codex, .opencode, or ./local_auth directory."));
             }
+            println!("Auth file created successfully at: {:?} (local fallback, move to ~/.codex or ~/.opencode for best compatibility)", local_auth_path);
+            println!("WARNING: Using local fallback directory for authentication. Move auth.json to ~/.codex or ~/.opencode for best compatibility and Opencode integration.");
+            return Ok(());
         }
-        let exit_status = spawned
-            .child
-            .lock()
-            .ok()
-            .and_then(|mut child| child.try_wait().ok().flatten());
-        if let Some(status) = exit_status {
-            // The helper may exit right after writing the file (or die on a
-            // stray browser request just after success) — check once more.
-            if auth_written(&modified_before) {
-                break Ok(());
-            }
-            let stderr_tail = spawned
-                .stderr
-                .lock()
-                .ok()
-                .map(|buffer| String::from_utf8_lossy(&buffer).to_string())
-                .unwrap_or_default();
-            let tail_start = stderr_tail.len().saturating_sub(400);
-            break Err(anyhow::anyhow!(
-                "Login helper exited ({status}) before {:?} was written.\n{}",
-                auth_path,
-                &stderr_tail[tail_start..]
-            ));
-        }
-        if started.elapsed() > std::time::Duration::from_secs(600) {
-            break Err(anyhow::anyhow!("Login timed out after 10 minutes."));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    };
-
-    // The helper's job ends the moment auth.json lands; left alone it lingers
-    // on port 1455 until the browser hits /success.  Stop it either way.
-    if let Ok(mut child) = spawned.child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
+        used_opencode = true;
     }
-    outcome?;
 
-    println!("Auth file created successfully at: {:?}", auth_path);
+    if used_opencode {
+        println!(
+            "Auth file created successfully at: {:?} (Opencode integration)",
+            opencode_auth_path
+        );
+    } else {
+        println!(
+            "Auth file created successfully at: {:?} (Codex Proxy Server)",
+            codex_auth_path
+        );
+    }
+
     info!("Login successful");
     println!("Login completed!");
-    println!("If the relay server was running while you added a NEW slot, restart it to pick the slot up.");
     Ok(())
-}
-
-/// Menu 7: show what currently rides at the top of every request, and hand it over.
-///
-/// `instructions` is sent above the whole conversation on every call, and it is the
-/// one part of the prompt that an agent's own system prompt cannot reach: whatever
-/// stands there frames everything the agent says about itself afterwards.  Until now
-/// the text was compiled into the binary, so the relay spoke for its operator.  A
-/// plain file is the smallest thing that gives the words back.
-fn edit_instructions() -> anyhow::Result<()> {
-    let path = core::config::instructions_file_path();
-    println!();
-    println!("=== Instructions sent above every request ===");
-    println!("File: {}", path.display());
-    match core::config::custom_instructions() {
-        Some(text) => {
-            println!("Source: this file");
-            println!();
-            println!("{text}");
-        }
-        None => {
-            println!("Source: built-in text (the file is absent or blank)");
-            println!();
-            println!("{}", chat_completions::MINIMAL_INSTRUCTIONS);
-        }
-    }
-    println!();
-    println!("  e      write your own (opens an editor)");
-    println!("  r      reset to the built-in text (deletes the file)");
-    println!("  Enter  back");
-    print!("> ");
-    io::stdout().flush().ok();
-    let mut choice = String::new();
-    if io::stdin().read_line(&mut choice)? == 0 {
-        return Ok(());
-    }
-    match choice.trim() {
-        "e" | "E" => {
-            if !path.exists() {
-                // Seed with the built-in text.  Editing from a working example shows
-                // the shape the field expects; a blank page invites an empty file,
-                // which upstream would like even less than a wrong one.
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).ok();
-                }
-                let mut seed = chat_completions::MINIMAL_INSTRUCTIONS.to_string();
-                seed.push('\n');
-                std::fs::write(&path, seed)?;
-            }
-            open_in_editor(&path);
-            println!("Saved text applies to the next request; no restart needed.");
-        }
-        "r" | "R" => match std::fs::remove_file(&path) {
-            Ok(()) => println!("Removed {}; the built-in text is back.", path.display()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                println!("Nothing to remove; the built-in text was already in use.")
-            }
-            Err(error) => return Err(error.into()),
-        },
-        _ => {}
-    }
-    Ok(())
-}
-
-/// RELAY_EDITOR, then the usual VISUAL/EDITOR, then whatever the platform always has.
-/// A failure to launch is not an error worth aborting on: the path is printed, and
-/// editing the file by hand does the same job.
-fn open_in_editor(path: &std::path::Path) {
-    use std::process::Command;
-    let editor = ["RELAY_EDITOR", "VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_family = "windows") { "notepad".to_string() } else { "nano".to_string() }
-        });
-    println!("Opening {} in {editor} ...", path.display());
-    match Command::new(&editor).arg(path).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => println!("{editor} exited with {status}. The file is at {}", path.display()),
-        Err(error) => {
-            println!("Could not launch {editor} ({error}).");
-            println!("Edit this file by hand: {}", path.display());
-        }
-    }
 }
 
 fn display_menu() {
@@ -373,26 +203,31 @@ fn display_menu() {
     println!("4. Refresh token");
     println!("5. Exit");
     println!("6. List running servers");
-    println!("7. Edit instructions");
-    print!("Please select an option (1-7): ");
+    print!("Please select an option (1-6): ");
     io::stdout().flush().unwrap();
 }
 
 fn get_user_choice() -> String {
     let mut choice = String::new();
-    match io::stdin().read_line(&mut choice) {
-        // EOF (stdin closed or redirected input ran out).  Without this the
-        // menu loop spins forever printing "Invalid choice" at 100% CPU.
-        Ok(0) => {
-            println!("stdin closed; exiting.");
-            "5".to_string()
-        }
-        Ok(_) => choice.trim().to_string(),
-        Err(error) => {
-            println!("Failed to read input ({error}); exiting.");
-            "5".to_string()
-        }
-    }
+    io::stdin()
+        .read_line(&mut choice)
+        .expect("Failed to read input");
+    choice.trim().to_string()
+}
+
+fn app_router(app_state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/chat/completions",
+            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
+        )
+        .route("/v1/models", get(models_handler))
+        .route("/v1/limits", get(limits_handler))
+        .route("/v1/account", get(account_handler))
+        .route("/v1/account/switch", post(account_switch_handler))
+        .route("/health", get(health_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(app_state)
 }
 
 async fn run_server() -> anyhow::Result<()> {
@@ -419,7 +254,10 @@ async fn run_server() -> anyhow::Result<()> {
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
         .unwrap_or_else(|error| {
-            warn!("shared client builder failed ({}), falling back to default", error);
+            warn!(
+                "shared client builder failed ({}), falling back to default",
+                error
+            );
             reqwest::Client::new()
         });
     let app_state = AppState {
@@ -430,30 +268,12 @@ async fn run_server() -> anyhow::Result<()> {
         client,
     };
 
-    // Create router.  The chat endpoint answers both with and without the /v1
-    // prefix: OpenAI-compatible clients disagree about whether base_url already
-    // contains "/v1", and a silent 404 from the bare router is a support trap.
-    // Same for /models vs /v1/models.
-    let app = Router::new()
-        .route(
-            "/chat/completions",
-            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
-        )
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
-        )
-        .route("/v1/models", get(models_handler))
-        .route("/models", get(models_handler))
-        .route("/v1/limits", get(limits_handler))
-        .route("/v1/account", get(account_handler))
-        .route("/v1/account/switch", post(account_switch_handler))
-        .route("/health", get(health_handler))
-        .layer(CorsLayer::permissive())
-        .with_state(app_state);
+    // Create router
+    let app = app_router(app_state);
 
     // Configure server.  Loopback only, deliberately; RELAY_PORT rescues the
-    // rare machine where 5011 is already taken.
+    // rare machine where 5011 is already taken (и это ручка `relay.port`
+    // в helene.json: оболочка Hélène поднимает реле именно так).
     let port = std::env::var("RELAY_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
@@ -475,56 +295,33 @@ async fn run_server() -> anyhow::Result<()> {
 }
 
 async fn refresh_token() -> anyhow::Result<()> {
-    println!("Refreshing token(s)...");
+    println!("Refreshing token...");
 
     // Load configuration
     let config = Config::load()?;
 
-    // Walk every place a login can live: the legacy single file and both
-    // account slots.  Menu 3 may have migrated the login into accounts/, and
-    // a refresh that only ever looked at the root would report "no auth" on a
-    // perfectly logged-in relay.
-    let auth_root = config.codex_home;
-    let candidates = [
-        ("primary (legacy)", auth_root.clone()),
-        ("primary", auth_root.join("accounts").join("primary")),
-        ("secondary", auth_root.join("accounts").join("secondary")),
-    ];
+    // Get the codex auth
+    let codex_auth = match CodexAuth::from_codex_home(&config.codex_home) {
+        Ok(Some(auth)) => auth,
+        _ => {
+            return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
+        }
+    };
 
-    let mut refreshed = 0;
-    for (slot, dir) in candidates {
-        if !dir.join("auth.json").is_file() {
-            continue;
+    // Get token data which will automatically refresh if needed
+    let token_data = match codex_auth.get_token_data().await {
+        Ok(data) => data,
+        Err(_) => {
+            return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
         }
-        // The relay's own auth only — never ~/.codex or the OPENAI_API_KEY env var
-        let codex_auth = match CodexAuth::from_auth_dir(&dir) {
-            Ok(Some(auth)) => auth,
-            _ => {
-                println!("Slot {slot}: auth.json is invalid. Choose menu option 3 (Login) to replace it.");
-                continue;
-            }
-        };
-        // Get token data which will automatically refresh if needed
-        match codex_auth.get_token_data().await {
-            Ok(data) => {
-                refreshed += 1;
-                match &data.account_id {
-                    Some(account_id) => println!("Slot {slot}: token OK, account {account_id}"),
-                    None => println!("Slot {slot}: token OK, account id missing"),
-                }
-            }
-            Err(error) => {
-                println!("Slot {slot}: refresh failed ({error}). Choose menu option 3 (Login).");
-            }
-        }
+    };
+
+    println!("Token refreshed successfully!");
+    match &token_data.account_id {
+        Some(account_id) => println!("Account ID: {}", account_id),
+        None => println!("Account ID: None"),
     }
 
-    if refreshed == 0 {
-        return Err(anyhow::anyhow!(
-            "No usable relay authentication found. Choose menu option 3 (Login) first."
-        ));
-    }
-    println!("Done: {refreshed} slot(s) refreshed.");
     Ok(())
 }
 
@@ -666,6 +463,7 @@ async fn list_running_servers() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn check_authentication(config: &Config) -> anyhow::Result<()> {
     info!(
         "Checking authentication in directory: {:?}",
@@ -674,34 +472,69 @@ async fn check_authentication(config: &Config) -> anyhow::Result<()> {
     let auth_file_path = config.codex_home.join("auth.json");
     info!("Looking for auth file at: {:?}", auth_file_path);
 
-    if !auth_file_path.is_file() {
-        warn!("Dedicated relay auth file not found");
-        return Err(anyhow::anyhow!(
-            "No relay authentication found at {:?}. Choose menu option 3 (Login) first.",
-            auth_file_path
-        ));
+    if auth_file_path.exists() {
+        info!("Auth file found!");
+        // Try to read the file to check if it's valid
+        match std::fs::read_to_string(&auth_file_path) {
+            Ok(_content) => {
+                // Auth file content preview removed for security
+            }
+            Err(e) => {
+                error!("Error reading auth file: {}", e);
+                return Err(anyhow::anyhow!("Failed to read auth file: {}", e));
+            }
+        }
+    } else {
+        warn!("Auth file not found!");
+        // List files in the directory to see what's there
+        if let Ok(entries) = std::fs::read_dir(&config.codex_home) {
+            info!("Files in codex home directory:");
+            for entry in entries.flatten() {
+                info!("  - {}", entry.file_name().to_string_lossy());
+            }
+        }
+
+        // Check if we're in .codex or .opencode and provide specific guidance
+        if let Some(home_dir) = dirs::home_dir() {
+            let codex_path = home_dir.join(".codex");
+            let opencode_path = home_dir.join(".opencode");
+
+            if config.codex_home == codex_path {
+                info!("Looking in .codex directory. Checking if auth file exists in .opencode...");
+                let opencode_auth = opencode_path.join("auth.json");
+                if opencode_auth.exists() {
+                    info!("Found auth file in .opencode directory. Consider moving it to .codex for better compatibility.");
+                }
+            } else if config.codex_home == opencode_path {
+                info!("Looking in .opencode directory. Checking if auth file exists in .codex...");
+                let codex_auth = codex_path.join("auth.json");
+                if codex_auth.exists() {
+                    info!("Found auth file in .codex directory. Using that instead.");
+                }
+            }
+        }
     }
 
-    let codex_auth = match CodexAuth::from_auth_dir(&config.codex_home) {
+    let codex_auth = match CodexAuth::from_codex_home(&config.codex_home) {
         Ok(Some(auth)) => auth,
         _ => {
-            return Err(anyhow::anyhow!("Relay auth.json is invalid. Choose menu option 3 (Login) to replace it."));
+            return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
         }
     };
 
     let token_data = match codex_auth.get_token_data().await {
         Ok(data) => data,
         Err(_) => {
-            return Err(anyhow::anyhow!("Relay token data is unavailable. Choose menu option 3 (Login)."));
+            return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
         }
     };
 
     if token_data.access_token.is_empty() {
-        return Err(anyhow::anyhow!("Relay access token is empty. Choose menu option 3 (Login)."));
+        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
     }
 
     if token_data.account_id.is_none() {
-        return Err(anyhow::anyhow!("Relay account ID is unavailable. Choose menu option 3 (Login)."));
+        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
     }
 
     // Log token information for debugging
@@ -841,119 +674,6 @@ async fn account_switch_handler(
     }
 }
 
-/// Collect the upstream chunk stream into one OpenAI-shaped `chat.completion`.
-///
-/// The upstream path is stream-only, and until now the parsed `"stream": false`
-/// was ignored — every client got SSE whether it could read it or not, so a
-/// non-streaming OpenAI SDK call tried to parse an SSE body as JSON and failed.
-/// Tool calls arrive as complete calls (one array element each, with its own
-/// index), so aggregation appends them; content concatenates; the last
-/// finish_reason, usage, and relay_terminal win.
-async fn aggregate_to_single_response(
-    mut chunks: tokio::sync::mpsc::Receiver<anyhow::Result<core::models::ResponseEvent>>,
-    requested_model: String,
-) -> Response {
-    let mut id = None;
-    let mut created = None;
-    let mut role = String::from("assistant");
-    let mut content = String::new();
-    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let mut finish_reason: Option<String> = None;
-    let mut usage: Option<core::models::Usage> = None;
-    let mut relay_terminal: Option<core::models::RelayTerminal> = None;
-
-    while let Some(event) = chunks.recv().await {
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                error!("Non-streaming aggregation failed mid-stream: {}", error);
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": format!("Upstream stream failed: {}", error),
-                            "type": "upstream_error",
-                            "code": "stream_error"
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        };
-        if id.is_none() {
-            id = Some(event.id.clone());
-            created = Some(event.created);
-        }
-        if event.usage.is_some() {
-            usage = event.usage.clone();
-        }
-        if event.relay_terminal.is_some() {
-            relay_terminal = event.relay_terminal.clone();
-        }
-        for choice in &event.choices {
-            if let Some(new_role) = &choice.delta.role {
-                role = new_role.clone();
-            }
-            if let Some(chunk_content) = &choice.delta.content {
-                content.push_str(chunk_content);
-            }
-            if let Some(calls) = choice.delta.tool_calls.as_ref().and_then(|v| v.as_array()) {
-                tool_calls.extend(calls.iter().cloned());
-            }
-            if let Some(reason) = &choice.finish_reason {
-                finish_reason = Some(reason.clone());
-            }
-        }
-    }
-
-    let Some(id) = id else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": {
-                    "message": "Upstream produced no chunks at all",
-                    "type": "upstream_error",
-                    "code": "empty_response"
-                }
-            })),
-        )
-            .into_response();
-    };
-
-    // OpenAI returns content: null (not "") on a pure tool-call turn.
-    let content_value = if content.is_empty() && !tool_calls.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(content)
-    };
-    let mut message = serde_json::json!({ "role": role, "content": content_value });
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = serde_json::Value::Array(tool_calls);
-    }
-    let mut body = serde_json::json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": created.unwrap_or_else(|| chrono::Utc::now().timestamp()),
-        "model": requested_model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_string()),
-        }],
-        "usage": usage.unwrap_or(core::models::Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            prompt_tokens_details: None,
-        }),
-    });
-    if let Some(terminal) = relay_terminal {
-        body["relay_terminal"] =
-            serde_json::to_value(&terminal).unwrap_or(serde_json::Value::Null);
-    }
-    Json(body).into_response()
-}
-
 async fn chat_completions_handler(
     State(state): State<AppState>,
     _headers: HeaderMap,
@@ -983,19 +703,6 @@ async fn chat_completions_handler(
         }
     };
 
-    // llama.cpp-style clients (Ouroboros's local lane among them) hardcode the
-    // slug "local-model" because llama-cpp-python ignores the field.  Map that
-    // one literal onto the relay default BEFORE validation; every other unknown
-    // name stays a strict-list 404 so real typos keep failing loudly.
-    if request.model == core::models::LOCAL_MODEL_ALIAS {
-        info!(
-            "model alias: {} -> {}",
-            core::models::LOCAL_MODEL_ALIAS,
-            state.config.model
-        );
-        request.model = state.config.model.clone();
-    }
-
     info!("🚀 CHAT COMPLETIONS REQUEST RECEIVED!");
     info!("Request messages count: {}", request.messages.len());
     info!("Request tools count: {}", request.tools.len());
@@ -1013,10 +720,7 @@ async fn chat_completions_handler(
     info!("Request model supported: {}", model_known);
     if !model_known {
         warn!("Invalid model requested (value redacted)");
-        let snapshot = state
-            .catalog
-            .snapshot(&state.accounts, &state.client)
-            .await;
+        let snapshot = state.catalog.snapshot(&state.accounts, &state.client).await;
         return Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -1030,8 +734,9 @@ async fn chat_completions_handler(
                     "type": "model_not_found",
                     "code": "model_not_found"
                 }
-            }))
-        ).into_response());
+            })),
+        )
+            .into_response());
     }
 
     // Reasoning effort: the catalog says which levels this model takes.
@@ -1040,10 +745,7 @@ async fn chat_completions_handler(
     // (~5k prompt tokens per turn). Clamp to the nearest level the model
     // supports before anything goes upstream; models the catalog knows no
     // levels for are left exactly as before.
-    let snapshot = state
-        .catalog
-        .snapshot(&state.accounts, &state.client)
-        .await;
+    let snapshot = state.catalog.snapshot(&state.accounts, &state.client).await;
     if let Some(entry) = snapshot.find(&request.model) {
         let wanted = request
             .reasoning_effort
@@ -1084,9 +786,6 @@ async fn chat_completions_handler(
             .into_response());
     }
 
-    let wants_stream = request.stream;
-    let requested_model = request.model.clone();
-
     // Process the chat completion
     match chat_completions::stream_chat_completions(
         &state.config,
@@ -1097,14 +796,9 @@ async fn chat_completions_handler(
     .await
     {
         Ok(response_stream) => {
-            if !wants_stream {
-                info!("✅ Chat completion started (non-streaming aggregation)");
-                return Ok(aggregate_to_single_response(response_stream, requested_model).await);
-            }
             info!("✅ Chat completion stream started successfully");
             // Convert the response stream to SSE
-            let sse_stream = tokio_stream::wrappers::ReceiverStream::new(response_stream)
-                .map(|result| {
+            let sse_stream = response_stream.map(|result| {
                     match result {
                         Ok(event) => {
                             let json = serde_json::to_string(&event).unwrap_or_else(|e| {
@@ -1144,5 +838,281 @@ async fn chat_completions_handler(
             )
                 .into_response())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use base64::Engine;
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::tempdir;
+    use tower::ServiceExt;
+
+    fn write_test_account(root: &std::path::Path, slot: &str, account_id: &str) {
+        let home = root.join("accounts").join(slot);
+        std::fs::create_dir_all(&home).unwrap();
+        let claims = json!({"email":format!("{slot}@example.test"),"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}});
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        std::fs::write(home.join("auth.json"), json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"id_token":format!("e30.{encoded}.c2ln"),"access_token":format!("synthetic-{slot}"),"refresh_token":format!("refresh-{slot}"),"account_id":account_id},
+            "last_refresh": chrono::Utc::now().to_rfc3339()
+        }).to_string()).unwrap();
+    }
+
+    async fn http_post(root: &std::path::Path, upstream_url: String) -> (Response, AccountRouter) {
+        chat_completions::set_test_upstream_url(Some(upstream_url));
+        let accounts = AccountRouter::load(root).await.unwrap();
+        let app = app_router(AppState {
+            config: Arc::new(Config {
+                codex_home: root.to_path_buf(),
+                chatgpt_base_url: String::new(),
+                model: "gpt-5.6-sol".to_string(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: Some("minimal".to_string()),
+                parallel_tool_calls: false,
+            }),
+            accounts: accounts.clone(),
+            limits: LimitsCache::default(),
+            catalog: ModelCatalog::static_only(),
+            client: reqwest::Client::new(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]})
+                    .to_string(),
+            ))
+            .unwrap();
+        (app.oneshot(request).await.unwrap(), accounts)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn http_status_matrix_uses_distinct_accounts_and_preserves_mixed_facts() {
+        let _lever = chat_completions::test_lever_guard();
+        chat_completions::force_test_terminal_field();
+        for (primary_status, secondary_status) in [(401u16, 429u16), (429, 401)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+            let seen_server = seen.clone();
+            let hit = Arc::new(AtomicUsize::new(0));
+            let hit_server = hit.clone();
+            let upstream = Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+                let seen = seen_server.clone();
+                let hit = hit_server.clone();
+                async move {
+                    let account_id = headers
+                        .get("chatgpt-account-id")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let authorization = headers
+                        .get("authorization")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    seen.lock()
+                        .unwrap()
+                        .push((account_id.clone(), authorization.clone()));
+                    hit.fetch_add(1, Ordering::SeqCst);
+
+                    // Select the fault from the actual account identity. A replay
+                    // with a stale bearer or account id must not accidentally pass
+                    // merely because it happened to be the second HTTP request.
+                    let code = match (account_id.as_str(), authorization.as_str()) {
+                        ("acct-primary", "Bearer synthetic-primary") => primary_status,
+                        ("acct-secondary", "Bearer synthetic-secondary") => secondary_status,
+                        _ => StatusCode::BAD_REQUEST.as_u16(),
+                    };
+                    let body = if code == 429 {
+                        r#"{"error":{"code":"usage_limit_reached","resets_in_seconds":73}}"#
+                    } else {
+                        r#"{"error":{"message":"expired"}}"#
+                    };
+                    Response::builder()
+                        .status(code)
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, upstream).await;
+            });
+            let root = tempdir().unwrap();
+            write_test_account(root.path(), "primary", "acct-primary");
+            write_test_account(root.path(), "secondary", "acct-secondary");
+            let (response, accounts) =
+                http_post(root.path(), format!("http://{addr}/responses")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let wire = String::from_utf8(body.to_vec()).unwrap();
+            let data_line = wire
+                .lines()
+                .filter(|line| line.starts_with("data: "))
+                .find(|line| line.contains("subscriptions_unavailable"))
+                .expect("structured mixed-account terminal SSE data line");
+            let terminal: serde_json::Value =
+                serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+            let terminal = &terminal["relay_terminal"];
+            assert_eq!(terminal["code"], "subscriptions_unavailable");
+            let attempts = terminal["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 2);
+            let expected_attempts = if primary_status == 401 {
+                [
+                    ("primary", "subscription_needs_login", 401u64, None),
+                    (
+                        "secondary",
+                        "subscription_window_exhausted",
+                        429u64,
+                        Some(73u64),
+                    ),
+                ]
+            } else {
+                [
+                    (
+                        "primary",
+                        "subscription_window_exhausted",
+                        429u64,
+                        Some(73u64),
+                    ),
+                    ("secondary", "subscription_needs_login", 401u64, None),
+                ]
+            };
+            for (attempt, (slot, code, status, reset)) in attempts.iter().zip(expected_attempts) {
+                assert_eq!(attempt["slot"], slot);
+                assert_eq!(attempt["code"], code);
+                assert_eq!(attempt["status"], status);
+                if let Some(reset) = reset {
+                    assert_eq!(attempt["resets_in_seconds"], reset);
+                } else {
+                    assert!(attempt.get("resets_in_seconds").is_none());
+                }
+            }
+            assert_eq!(hit.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    (
+                        "acct-primary".to_string(),
+                        "Bearer synthetic-primary".to_string()
+                    ),
+                    (
+                        "acct-secondary".to_string(),
+                        "Bearer synthetic-secondary".to_string()
+                    )
+                ]
+            );
+            assert_eq!(accounts.active_slot().await, "secondary");
+            let slots = accounts.describe().await;
+            let primary = slots.iter().find(|slot| slot.slot == "primary").unwrap();
+            let secondary = slots.iter().find(|slot| slot.slot == "secondary").unwrap();
+            assert!(!primary.active);
+            assert!(secondary.active);
+            assert!(primary.cooldown_seconds_left > 0);
+            assert_eq!(secondary.cooldown_seconds_left, 0);
+            chat_completions::set_test_upstream_url(None);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dropping_http_sse_body_cancels_pending_upstream_read() {
+        let _lever = chat_completions::test_lever_guard();
+        struct Dropped(Arc<tokio::sync::Semaphore>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.add_permits(1);
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let upstream_dropped = Arc::new(tokio::sync::Semaphore::new(0));
+        let counter = hits.clone();
+        let dropped = upstream_dropped.clone();
+        let upstream = Router::new().fallback(axum::routing::any(move || {
+            let counter = counter.clone();
+            let dropped = dropped.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let stream = async_stream::stream! {
+                    let _guard = Dropped(dropped);
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"visible\"}}\n\n",
+                    ));
+                    std::future::pending::<()>().await;
+                };
+                Response::builder().status(200).header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream)).unwrap()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        chat_completions::set_test_upstream_url(Some(format!("http://{addr}/responses")));
+
+        let root = tempdir().unwrap();
+        write_test_account(root.path(), "primary", "acct-primary");
+        let app = app_router(AppState {
+            config: Arc::new(Config {
+                codex_home: root.path().to_path_buf(),
+                chatgpt_base_url: String::new(),
+                model: "gpt-5.6-sol".to_string(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: Some("minimal".to_string()),
+                parallel_tool_calls: false,
+            }),
+            accounts: AccountRouter::load(root.path()).await.unwrap(),
+            limits: LimitsCache::default(),
+            catalog: ModelCatalog::static_only(),
+            client: reqwest::Client::new(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("HTTP SSE must expose first event")
+            .expect("SSE body has data")
+            .expect("valid SSE data");
+        assert!(frame
+            .windows(b"visible".len())
+            .any(|window| window == b"visible"));
+        drop(body);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream_dropped.acquire(),
+        )
+        .await
+        .expect("dropping HTTP SSE body must cancel upstream")
+        .unwrap()
+        .forget();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        chat_completions::set_test_upstream_url(None);
     }
 }

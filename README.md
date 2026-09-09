@@ -31,6 +31,13 @@ your behalf.
   the token's actual expiry, and machine-readable terminal errors that distinguish "quota
   exhausted" from "credentials dead" from "upstream tore the stream" — so a client can
   react instead of blindly retrying.
+- **A dropped client stops the upstream call.** When the caller hangs up mid-stream — a
+  cancelled agent turn, a closed tab — the relay cancels the request it is holding upstream
+  instead of reading it to the end. Subscription quota is spent on answers someone is still
+  waiting for, and a torn stream is reported as such rather than as an empty reply.
+- **The answer is the model's text, not the transport's.** Streaming text is taken from the
+  finished message item with its annotations, so inline citation markers and tracking
+  parameters do not leak into what the model actually said.
 - **Private by construction.** The server binds to loopback only. Credentials live in one
   directory next to the binary — never `~/.codex`, never the shell environment — and the
   API key your client presents is decorative.

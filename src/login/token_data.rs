@@ -42,6 +42,7 @@ pub struct IdTokenInfo {
 }
 
 impl IdTokenInfo {
+    #[allow(dead_code)]
     pub fn get_chatgpt_plan_type(&self) -> Option<String> {
         self.chatgpt_plan_type.as_ref().map(|t| match t {
             PlanType::Known(plan) => format!("{plan:?}"),
@@ -71,6 +72,7 @@ impl PlanType {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_string(&self) -> String {
         match self {
             Self::Known(known) => format!("{known:?}").to_lowercase(),
@@ -256,7 +258,12 @@ mod tests {
         };
         #[expect(clippy::unwrap_used)]
         let payload_b64 = b64url_no_pad(&serde_json::to_vec(&payload).unwrap());
-        format!("{}.{}.{}", b64url_no_pad(b"{}"), payload_b64, b64url_no_pad(b"sig"))
+        format!(
+            "{}.{}.{}",
+            b64url_no_pad(b"{}"),
+            payload_b64,
+            b64url_no_pad(b"sig")
+        )
     }
 
     fn token_with(access: String) -> TokenData {
@@ -278,7 +285,10 @@ mod tests {
         let expires = 1_786_354_483_i64; // 2026-08-10T09:34:43Z
         let token = token_with(jwt_with_exp(Some(expires)));
 
-        assert!(!token.access_token_expiring(issued, 3600), "свежий токен не трогаем");
+        assert!(
+            !token.access_token_expiring(issued, 3600),
+            "свежий токен не трогаем"
+        );
         assert!(
             !token.access_token_expiring(expires - 7200, 3600),
             "за два часа до срока запаса ещё хватает"
@@ -300,7 +310,7 @@ mod tests {
     /// молчал полтора часа. Здесь охраняется именно то, что мы умеем поднять свой же
     /// испорченный файл, а не только правильный.
     #[test]
-    #[expect(clippy::expect_used, clippy::unwrap_used)]
+    #[expect(clippy::expect_used)]
     fn a_file_broken_by_our_own_refresh_still_loads() {
         let broken = serde_json::json!({
             "id_token": {"email": "user@example.com", "chatgpt_plan_type": "pro"},
@@ -308,7 +318,8 @@ mod tests {
             "refresh_token": "r",
             "account_id": "acct",
         });
-        let tokens: TokenData = serde_json::from_value(broken).expect("испорченный файл обязан читаться");
+        let tokens: TokenData =
+            serde_json::from_value(broken).expect("испорченный файл обязан читаться");
         assert_eq!(tokens.id_token.email.as_deref(), Some("user@example.com"));
         assert_eq!(
             tokens.id_token.chatgpt_plan_type,
@@ -329,7 +340,12 @@ mod tests {
                 "email": "user@example.com",
                 "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
             });
-            format!("{}.{}.{}", b64(b"{}"), b64(&serde_json::to_vec(&payload).unwrap()), b64(b"sig"))
+            format!(
+                "{}.{}.{}",
+                b64(b"{}"),
+                b64(&serde_json::to_vec(&payload).unwrap()),
+                b64(b"sig")
+            )
         };
         let value = serde_json::json!({
             "id_token": jwt,
@@ -337,7 +353,8 @@ mod tests {
             "refresh_token": "r",
             "account_id": "acct",
         });
-        let tokens: TokenData = serde_json::from_value(value).expect("нормальный файл обязан читаться");
+        let tokens: TokenData =
+            serde_json::from_value(value).expect("нормальный файл обязан читаться");
         assert_eq!(tokens.id_token.email.as_deref(), Some("user@example.com"));
     }
 

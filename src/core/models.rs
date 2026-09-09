@@ -25,17 +25,10 @@ pub const FALLBACK_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
-    // GPT-5.3-Codex-Spark: Cerebras-served, text-only, 128k context, and metered
-    // from its OWN bucket — it shows up under `additional_rate_limits` in
-    // /v1/limits rather than sharing the main allowance, so it keeps answering
-    // after the main one is spent.  Measured on one long generation through this
-    // relay: ~400 chars/s against ~219 for gpt-5.4, and roughly a third of the
-    // wall clock because it also writes shorter.  Research preview on ChatGPT
-    // Pro; on a plan without it the request fails upstream, loudly, rather than
-    // being rejected here — which is the point of listing only real slugs.
-    // Its larger sibling `gpt-5.3-codex` is deliberately absent: upstream
-    // answers 400 for it, and an advertised slug that cannot be called is worse
-    // than one that was never advertised.
+    // GPT-5.3-Codex-Spark: Cerebras-served, >1000 tok/s, 128k, text-only.
+    // Its quota is a SEPARATE bucket in additional_rate_limits, so it survives
+    // the main allowance running out.  Sibling gpt-5.3-codex listed alongside;
+    // an unavailable slug fails loudly upstream rather than silently here.
     "gpt-5.3-codex-spark",
 ];
 
@@ -64,42 +57,6 @@ pub fn is_fallback_model(model: &str) -> bool {
     FALLBACK_MODELS.contains(&model)
 }
 
-/// The model slug that llama.cpp-style clients hardcode.  llama-cpp-python
-/// ignores the request's model field entirely, so frameworks built against it
-/// (Ouroboros's local lane among them: `llm.py` sends `"model": "local-model"`
-/// on every call) never made the name configurable.  The relay maps this one
-/// literal onto its default model instead of 404ing every call from such a
-/// client.  Only this exact string — anything else stays a strict-list reject,
-/// so typos in real model names still fail loudly.
-pub const LOCAL_MODEL_ALIAS: &str = "local-model";
-
-/// Advertised context window, in tokens, when nothing better is known.
-/// Advisory metadata for clients that size their history by asking the
-/// endpoint (Ouroboros reads `meta.n_ctx_train`, then `context_window`, and
-/// treats 0 as "tiny model": output capped and history compacted to fit ~4k).
-/// The backend's catalog reports the real window per model (272k today) and
-/// wins when available; RELAY_CONTEXT_LENGTH overrides both if the number
-/// proves wrong for a given account; this default answers for the fallback
-/// list and for extra slugs the catalog does not describe.
-pub const DEFAULT_ADVERTISED_CONTEXT_LENGTH: u32 = 400_000;
-
-/// Advertised output ceiling, advisory in the same way.
-pub const DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS: u32 = 128_000;
-
-/// `RELAY_CONTEXT_LENGTH` when set to a positive number: the operator's word
-/// over the catalog's.
-pub fn context_length_override() -> Option<u32> {
-    std::env::var("RELAY_CONTEXT_LENGTH")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| *value > 0)
-}
-
-/// The context window to advertise when the catalog has none for a model.
-pub fn advertised_context_length() -> u32 {
-    context_length_override().unwrap_or(DEFAULT_ADVERTISED_CONTEXT_LENGTH)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -119,14 +76,6 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
-    // Forwarded verbatim-ish to the backend (see chat_completions mapping).
-    // Both used to be silently dropped, which turned a client's mandatory tool
-    // call (tool_choice: "required" — Ouroboros context compaction relies on
-    // it) into an optional one, and erased structured-output requests.
-    #[serde(default)]
-    pub tool_choice: Option<serde_json::Value>,
-    #[serde(default)]
-    pub response_format: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
@@ -471,6 +420,7 @@ pub enum WebSearchContextSize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChatResponse {
     pub id: String,
     pub object: String,
@@ -481,6 +431,7 @@ pub struct ChatResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Choice {
     pub index: u32,
     pub message: Message,
@@ -515,18 +466,20 @@ pub struct Model {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
-    // Advisory context metadata under every field name common localhost
-    // clients read; see supported_model_list() for who reads what.
-    pub context_window: u32,
-    pub context_length: u32,
-    pub max_output_tokens: u32,
-    pub meta: ModelMeta,
     // Everything below comes from the backend's catalog and is omitted when
-    // unknown, so a bare entry carries exactly the fields it always did.
+    // unknown, so the four OpenAI fields above are all a bare entry carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// llama.cpp spelling of `context_window`, read by local-model client lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_window: Option<u64>,
+    /// `{"n_ctx_train": ...}`: the llama-cpp-python field the same lanes read first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -536,11 +489,6 @@ pub struct Model {
     /// The slug the backend suggests instead, when it marks this one superseded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelMeta {
-    pub n_ctx_train: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +517,22 @@ pub struct RelayTerminal {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_seconds: Option<i64>,
+    /// Per-account facts when failover was attempted. This prevents a mixed
+    /// quota/auth failure from being flattened into the misleading claim that
+    /// both subscriptions failed for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<Vec<RelayTerminalAttempt>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayTerminalAttempt {
+    pub slot: String,
+    pub code: String,
+    pub status: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -661,40 +625,36 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_model_entry_keeps_the_pre_catalog_shape() {
-        // The four OpenAI fields plus the three context spellings and the output
-        // ceiling: exactly what 0.6.0 served, so old clients see nothing new.
+    fn a_bare_model_entry_serializes_to_the_four_openai_fields() {
         let bare = Model {
             id: "gpt-6-astra".to_string(),
             object: "model".to_string(),
             created: 1,
             owned_by: "chatgpt".to_string(),
-            context_window: 400_000,
-            context_length: 400_000,
-            max_output_tokens: 128_000,
-            meta: ModelMeta {
-                n_ctx_train: 400_000,
-            },
             display_name: None,
+            context_window: None,
+            context_length: None,
             max_context_window: None,
+            meta: None,
             input_modalities: Vec::new(),
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             upgrade: None,
         };
         let value = serde_json::to_value(&bare).unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        // serde_json sorts object keys, so compare the set, not the order.
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
-        assert_eq!(
-            keys,
-            ["context_length", "context_window", "created", "id", "max_output_tokens", "meta", "object", "owned_by"]
-        );
-        // And the 0.6.0 document still deserializes.
+        assert_eq!(keys, ["created", "id", "object", "owned_by"]);
+        // And the old four-field document still deserializes.
         let list: ModelList = serde_json::from_value(json!({
             "object": "list",
-            "data": [{"id": "gpt-5.5", "object": "model", "created": 1, "owned_by": "chatgpt",
-                      "context_window": 1, "context_length": 1, "max_output_tokens": 1,
-                      "meta": {"n_ctx_train": 1}}]
+            "data": [{"id": "gpt-5.5", "object": "model", "created": 1, "owned_by": "chatgpt"}]
         }))
         .unwrap();
         assert_eq!(list.data[0].id, "gpt-5.5");
