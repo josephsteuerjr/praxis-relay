@@ -23,5 +23,6 @@ WORKDIR /app
 COPY --from=builder /usr/src/codex/target/release/codex-proxy-server /usr/local/bin/relay
 ENV HOME=/root RUST_LOG=info RELAY_LOG_DIR=/app/logs
 EXPOSE 5011
-# main() shows an interactive menu; feed "1" (Run server) on stdin to auto-start.
-CMD ["sh", "-c", "echo 1 | relay"]
+# Since 0.8.1 the binary takes its action from argv, so the old `echo 1 | relay`
+# workaround for the interactive menu is gone: `relay serve` starts the server.
+CMD ["relay", "serve"]

@@ -27,7 +27,7 @@ use core::models::{ChatRequest, ModelList, MAX_CHAT_REQUEST_BYTES};
 use login::lib::CodexAuth;
 
 // For CLI menu
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 #[derive(Clone)]
 struct AppState {
@@ -96,6 +96,57 @@ async fn main() {
     info!("=== Starting Codex Proxy Server ==="); // Codex Proxy Server
     info!("Log directory: {}", logs_dir.display());
     info!("Timestamp: {}", chrono::Utc::now().to_rfc3339());
+
+    // Запуск без человека. До 10.09 argv игнорировался целиком: оболочка
+    // Hélène зовёт `helene-relay serve`, реле печатало меню, читало из
+    // закрытого stdin конец файла, отвечало «Invalid choice» — и крутилось так,
+    // не заняв порта ни разу. Живая проба 10.09: 70 секунд процессора за
+    // минуту, `/v1/models` молчит; на машине владельца это было незаметно,
+    // потому что порт 5011 держало реле прежнего поколения. Контейнер её прода
+    // обходил ту же дыру снаружи (`echo 1 | relay` в Dockerfile).
+    //
+    // Правило простое: назван аргумент — делаем названное и выходим; аргумента
+    // нет и stdin не терминал (служба, контейнер, ребёнок оболочки) — поднимаем
+    // сервер; человеку за терминалом остаётся прежнее меню.
+    let action = std::env::args().nth(1).unwrap_or_default();
+    match action.trim() {
+        "serve" | "server" | "run" => {
+            if let Err(e) = run_server().await {
+                error!("Failed to start server: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        "login" => {
+            if let Err(e) = run_login().await {
+                error!("Login failed: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        "refresh" => {
+            if let Err(e) = refresh_token().await {
+                error!("Token refresh failed: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        "" => {
+            if !io::stdin().is_terminal() {
+                info!("stdin не терминал — поднимаю сервер без меню");
+                if let Err(e) = run_server().await {
+                    error!("Failed to start server: {}", e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+        other => {
+            eprintln!("Unknown argument: {other}");
+            eprintln!("Usage: relay [serve|login|refresh]  (no argument shows the menu)");
+            std::process::exit(2);
+        }
+    }
 
     // Display CLI menu
     loop {
@@ -674,11 +725,61 @@ async fn account_switch_handler(
     }
 }
 
+/// Ключ петли к реле: `RELAY_API_KEY`. Задан — вызов модели обязан принести его
+/// Bearer-ом; пусто — проверки нет вовсе (так живёт её серверное реле, у
+/// которого порт не выходит за контейнер).
+///
+/// Обещание было старше проверки. Оболочка Hélène передаёт ключ этой
+/// переменной с 0.4.x, установщик пишет в helene.json `sk-frame-…` и объясняет
+/// в коде: «открытый локальный порт позволял бы любому процессу на машине жечь
+/// подписку владельца». Реле переменную не читало, и любой процесс мог.
+fn loop_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        std::env::var("RELAY_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+    .as_deref()
+}
+
+/// Принёс ли запрос ключ петли. Нет ключа в среде — пускаем всех, как раньше.
+fn key_ok(headers: &HeaderMap) -> bool {
+    let Some(key) = loop_key() else { return true };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(|got| got.trim() == key)
+        .unwrap_or(false)
+}
+
 async fn chat_completions_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, StatusCode> {
+    if !key_ok(&headers) {
+        warn!("chat/completions без ключа петли (RELAY_API_KEY задан) — отказ");
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "missing or wrong Authorization: Bearer <RELAY_API_KEY>",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "invalid_api_key"
+                }
+            })),
+        )
+            .into_response());
+    }
     let mut request = match payload {
         Ok(Json(request)) => request,
         Err(rejection) => {
