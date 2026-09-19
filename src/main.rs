@@ -193,6 +193,25 @@ async fn main() {
 
 async fn run_login() -> anyhow::Result<()> {
     info!("Starting login process");
+    // RELAY_LOCAL=1: the host (Hélène) owns these credentials — they go to
+    // ./local_auth next to the working directory, never to ~/.codex. The host
+    // polls exactly that file; writing anywhere else looks to it like a login
+    // that never completed.
+    if login::lib::relay_local() {
+        let local_auth_dir = std::env::current_dir()?.join("local_auth");
+        std::fs::create_dir_all(&local_auth_dir)?;
+        let local_auth_path = local_auth_dir.join("auth.json");
+        println!("RELAY_LOCAL is set: auth file path: {:?}", local_auth_path);
+        login::lib::login_with_chatgpt(&local_auth_dir, false).await?;
+        if !local_auth_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Login failed: auth.json was not created in {:?}",
+                local_auth_dir
+            ));
+        }
+        println!("Auth file created successfully at: {:?}", local_auth_path);
+        return Ok(());
+    }
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     let codex_home = home_dir.join(".codex");

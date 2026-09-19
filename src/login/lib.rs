@@ -326,11 +326,65 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec
     });
 }
 
+/// RELAY_LOCAL=1 (Hélène and other embedding hosts): the credentials belong to THIS
+/// installation and live in ./local_auth of the working directory, never in ~/.codex.
+/// The host looks for ./local_auth/auth.json and would otherwise wait forever for a
+/// login that actually succeeded elsewhere.
+pub fn relay_local() -> bool {
+    relay_local_from(env::var("RELAY_LOCAL").ok().as_deref())
+}
+
+fn relay_local_from(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0")
+}
+
+/// The interpreter that runs the login callback server: RELAY_PYTHON when the host
+/// ships its own Python (Hélène's runtime), otherwise `python3` from PATH. On a Mac
+/// without the Xcode command line tools `python3` is a stub that opens an install
+/// dialog, so a host that has an interpreter must name it.
+pub fn python_interpreter() -> std::ffi::OsString {
+    interpreter_from(env::var_os("RELAY_PYTHON"))
+}
+
+fn interpreter_from(configured: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    if let Some(path) = configured {
+        if !path.is_empty() && Path::new(&path).exists() {
+            return path;
+        }
+    }
+    std::ffi::OsString::from("python3")
+}
+
+#[cfg(test)]
+mod host_env_tests {
+    use super::*;
+
+    #[test]
+    fn relay_local_is_a_flag_not_a_presence() {
+        assert!(relay_local_from(Some("1")));
+        assert!(relay_local_from(Some(" true ")));
+        assert!(!relay_local_from(Some("0")));
+        assert!(!relay_local_from(Some("")));
+        assert!(!relay_local_from(None));
+    }
+
+    #[test]
+    fn interpreter_falls_back_to_python3_when_the_named_one_is_missing() {
+        assert_eq!(interpreter_from(None), std::ffi::OsString::from("python3"));
+        assert_eq!(
+            interpreter_from(Some(std::ffi::OsString::from("/no/such/python"))),
+            std::ffi::OsString::from("python3")
+        );
+        let own = std::env::current_exe().unwrap();
+        assert_eq!(interpreter_from(Some(own.clone().into_os_string())), own.into_os_string());
+    }
+}
+
 /// Spawn the ChatGPT login Python server as a child process and return a handle to its process.
 #[allow(dead_code)]
 pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLogin> {
     let script_path = write_login_script_to_disk()?;
-    let mut cmd = std::process::Command::new("python3");
+    let mut cmd = std::process::Command::new(python_interpreter());
     cmd.arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
@@ -368,7 +422,7 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
 /// current process's stdout/stderr.
 pub async fn login_with_chatgpt(codex_home: &Path, capture_output: bool) -> std::io::Result<()> {
     let script_path = write_login_script_to_disk()?;
-    let child = Command::new("python3")
+    let child = Command::new(python_interpreter())
         .arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
