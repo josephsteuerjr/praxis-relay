@@ -330,6 +330,8 @@ async fn run_server() -> anyhow::Result<()> {
             );
             reqwest::Client::new()
         });
+    // Before any upstream call: the presented Codex version gates the model catalog.
+    chat_completions::resolve_codex_cli_version(&client).await;
     let app_state = AppState {
         config,
         accounts,

@@ -47,6 +47,75 @@ pub fn codex_cli_version() -> &'static str {
     })
 }
 
+/// Where the newest released Codex CLI announces itself: the npm package of the CLI.
+const CODEX_LATEST_URL: &str = "https://registry.npmjs.org/@openai/codex/latest";
+
+/// Settle the presented version once, before the server takes traffic.
+///
+/// 28.09.2026 (Hélène 1.2.4): the built-in default had gone stale -- the relay
+/// presented 0.153.3 while 0.157.1 was out, and the backend, which gates its
+/// catalog on the client version, simply left newer models off the list. The
+/// owner saw "the relay hardcodes the models". Now: `RELAY_CODEX_VERSION` still
+/// wins when set; otherwise the newest released CLI from npm is presented when it
+/// is newer than the built-in; no answer in five seconds -- the built-in, as before.
+pub async fn resolve_codex_cli_version(client: &Client) {
+    let pinned = std::env::var(RELAY_CODEX_VERSION_ENV)
+        .ok()
+        .is_some_and(|raw| !raw.trim().is_empty());
+    if pinned || CODEX_CLI_VERSION_CELL.get().is_some() {
+        return;
+    }
+    let latest = fetch_latest_codex_version(client).await;
+    let chosen = match latest.as_deref() {
+        Some(found) if version_is_newer(found, CODEX_CLI_VERSION_DEFAULT) => found.to_string(),
+        _ => CODEX_CLI_VERSION_DEFAULT.to_string(),
+    };
+    tracing::info!(
+        "codex client version: {} (newest released: {}, built-in {})",
+        chosen,
+        latest.as_deref().unwrap_or("unknown"),
+        CODEX_CLI_VERSION_DEFAULT
+    );
+    let _ = CODEX_CLI_VERSION_CELL.set(chosen);
+}
+
+async fn fetch_latest_codex_version(client: &Client) -> Option<String> {
+    let response = client
+        .get(CODEX_LATEST_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    let version = body.get("version")?.as_str()?.trim().to_string();
+    parse_version(&version).map(|_| version)
+}
+
+/// `major.minor.patch`, digits only -- anything else is not a version we present.
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = raw.split('.');
+    let triple = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(triple)
+}
+
+fn version_is_newer(candidate: &str, than: &str) -> bool {
+    match (parse_version(candidate), parse_version(than)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
 /// The full `User-Agent` value, derived from the version above so the two can
 /// never disagree -- they used to be two independent literals in two files.
 pub fn codex_user_agent() -> &'static str {
@@ -3756,5 +3825,27 @@ mod tests {
         let status = reqwest::StatusCode::UNAUTHORIZED;
         assert!(subscription_auth_error(status));
         assert!(!subscription_quota_error(status, "{}"));
+    }
+}
+
+#[cfg(test)]
+mod codex_version_tests {
+    use super::{parse_version, version_is_newer, CODEX_CLI_VERSION_DEFAULT};
+
+    #[test]
+    fn only_plain_triples_are_versions() {
+        assert_eq!(parse_version("0.157.1"), Some((0, 157, 1)));
+        assert_eq!(parse_version("0.157"), None);
+        assert_eq!(parse_version("0.157.1-alpha"), None);
+        assert_eq!(parse_version("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn newer_means_newer_by_numbers_not_by_text() {
+        assert!(version_is_newer("0.157.1", CODEX_CLI_VERSION_DEFAULT));
+        assert!(version_is_newer("0.153.10", "0.153.3"));
+        assert!(!version_is_newer("0.153.3", "0.153.3"));
+        assert!(!version_is_newer("0.99.0", "0.153.3"));
+        assert!(!version_is_newer("garbage", "0.153.3"));
     }
 }
