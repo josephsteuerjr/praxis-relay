@@ -16,6 +16,7 @@ RUN touch src/main.rs && cargo build --release
 
 FROM builder AS gate
 RUN cargo test --no-run --locked
+RUN rustup component add clippy
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
