@@ -1812,7 +1812,7 @@ fn clean_model_text(text: &str, annotations: &[Value]) -> String {
         .collect();
     // С конца — чтобы замены не сдвигали индексы ещё не обработанных диапазонов;
     // пересекающийся с уже применённым диапазон пропускаем.
-    spans.sort_by(|a, b| b.0.cmp(&a.0));
+    spans.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut floor = usize::MAX;
     for (start, end, url) in spans {
         if end > floor {
@@ -2259,7 +2259,7 @@ mod tests {
                         .status(200)
                         .header("content-type", "text/event-stream")
                         .body(Body::from(
-                            "data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"ok\"}}\n\n\
+                            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}}\n\n\
                              data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n",
                         ))
                         .unwrap()
@@ -2271,13 +2271,15 @@ mod tests {
                         .body(Body::from(body))
                         .unwrap(),
                     Upstream::TornAfterText => {
+                        // Готовый message item, затем обрыв: draft deltas are withheld
+                        // by the current text contract, so they cannot prove tx.send.
                         // Сначала кусок настоящего текста, затем обрыв: это тот самый
                         // случай, где ответ уже начался, а канал умер на середине.
                         // Pausing makes the response head and first delta observable
                         // before the injected body failure.
                         let chunks = async_stream::stream! {
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                                b"data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"\xd1\x87\xd0\xb0\"}}\n\n",
+                                b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"\xd1\x87\xd0\xb0\"}]}}\n\n",
                             ));
                             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                             yield Err(std::io::Error::other("upstream tore the byte stream"));
@@ -2400,7 +2402,7 @@ mod tests {
                             let _dropped = Dropped(body_dropped);
                             event_sent.add_permits(1);
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                                b"data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"visible\"}}\n\n",
+                                b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"visible\"}]}}\n\n",
                             ));
                             std::future::pending::<()>().await;
                         };
@@ -2431,7 +2433,7 @@ mod tests {
                     Upstream::TextThenError => {
                         let chunks = async_stream::stream! {
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                                b"data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"partial\"}}\n\n",
+                                b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\n",
                             ));
                             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
                             yield Err(std::io::Error::other("injected after partial output"));

@@ -294,7 +294,7 @@ impl fmt::Display for RequestValidationError {
 
 impl std::error::Error for RequestValidationError {}
 
-fn validate_image_url(image_url: &str) -> Result<(), String> {
+pub(super) fn validate_image_url(image_url: &str) -> Result<(), String> {
     if image_url.starts_with("data:") {
         return validate_data_image_url(image_url, MAX_DATA_IMAGE_BYTES);
     }

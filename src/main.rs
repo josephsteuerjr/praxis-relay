@@ -292,6 +292,28 @@ fn app_router(app_state: AppState) -> Router {
             post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
         )
         .route("/v1/models", get(models_handler))
+        .route(
+            "/v1/images/generations",
+            post(image_generation_handler)
+                .layer(DefaultBodyLimit::max(core::images::MAX_IMAGE_REQUEST_BYTES)),
+        )
+        .route(
+            "/images/generations",
+            post(image_generation_handler)
+                .layer(DefaultBodyLimit::max(core::images::MAX_IMAGE_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(image_edit_handler)
+                .layer(DefaultBodyLimit::max(core::images::MAX_IMAGE_REQUEST_BYTES)),
+        )
+        .route(
+            "/images/edits",
+            post(image_edit_handler)
+                .layer(DefaultBodyLimit::max(core::images::MAX_IMAGE_REQUEST_BYTES)),
+        )
+        .route("/v1/images/models", get(image_models_handler))
+        .route("/images/models", get(image_models_handler))
         .route("/v1/limits", get(limits_handler))
         .route("/v1/account", get(account_handler))
         .route("/v1/account/switch", post(account_switch_handler))
@@ -781,6 +803,67 @@ fn key_ok(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+async fn image_models_handler(headers: HeaderMap) -> Response {
+    if !key_ok(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"invalid_api_key","message":"Missing or wrong relay key"}}))).into_response();
+    }
+    Json(serde_json::json!({"object":"list","data":[{"id":core::images::DEFAULT_IMAGE_MODEL,"object":"model","owned_by":"chatgpt","modalities":["image"],"operations":["generate","edit"]}],"source":"codex_builtin","entitlement_verified":false})).into_response()
+}
+
+async fn image_generation_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<core::images::ImageRequest>, JsonRejection>,
+) -> Response {
+    image_handler(state, headers, payload, false).await
+}
+
+async fn image_edit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<core::images::ImageRequest>, JsonRejection>,
+) -> Response {
+    image_handler(state, headers, payload, true).await
+}
+
+async fn image_handler(
+    state: AppState,
+    headers: HeaderMap,
+    payload: Result<Json<core::images::ImageRequest>, JsonRejection>,
+    edit: bool,
+) -> Response {
+    if !key_ok(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"invalid_api_key","message":"Missing or wrong relay key"}}))).into_response();
+    }
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(rejection) => return (rejection.status(), Json(serde_json::json!({"error":{"code":"invalid_image_request","message":rejection.body_text()}}))).into_response(),
+    };
+    if let Err(message) = request.validate(edit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{"code":"invalid_image_request","message":message}})),
+        )
+            .into_response();
+    }
+    let turn_id = headers
+        .get("x-codex-image-turn-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let reply = core::images::forward(
+        &state.accounts,
+        &state.client,
+        &request,
+        &state.config.chatgpt_base_url,
+        edit,
+        &turn_id,
+    )
+    .await;
+    (reply.status, reply.headers, Json(reply.body)).into_response()
+}
+
 async fn chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -987,6 +1070,127 @@ mod tests {
         }).to_string()).unwrap();
     }
 
+    #[tokio::test]
+    async fn image_routes_forward_exact_contract_and_preserve_quota_error() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let records = seen.clone();
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture");
+        let upstream = Router::new().fallback(axum::routing::post(move |uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let records = records.clone(); let png = png.clone();
+            async move {
+                records.lock().unwrap().push(json!({"path":uri.path(),"body":body,"account":headers.get("chatgpt-account-id").unwrap().to_str().unwrap(),"authorization":headers.get("authorization").unwrap().to_str().unwrap(),"turn":headers.get("x-codex-image-turn-id").unwrap().to_str().unwrap()}));
+                let mut response = if body["prompt"] == "quota" {
+                    (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"image_generation_limit_reached","message":"image allowance"}}))).into_response()
+                } else {
+                    Json(json!({"data":[{"b64_json":png,"generation_id":"generation-fixture"}],"size":"1254x1254","usage":{"input_tokens":21,"output_tokens":515}})).into_response()
+                };
+                response.headers_mut().insert("x-codex-imagegen-request-id", "request-fixture".parse().unwrap());
+                response
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let root = tempdir().unwrap();
+        write_test_account(root.path(), "primary", "acct-primary");
+        write_test_account(root.path(), "secondary", "acct-secondary");
+        let accounts = AccountRouter::load(root.path()).await.unwrap();
+        let app = app_router(AppState {
+            config: Arc::new(Config {
+                codex_home: root.path().into(),
+                chatgpt_base_url: format!("http://{address}"),
+                model: String::new(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: None,
+                parallel_tool_calls: false,
+            }),
+            accounts: accounts.clone(),
+            limits: LimitsCache::default(),
+            catalog: ModelCatalog::static_only(),
+            client: reqwest::Client::new(),
+        });
+        for (uri, edit, prompt, status) in [
+            ("/v1/images/generations", false, "draw", 200),
+            ("/images/edits", true, "edit", 200),
+            ("/v1/images/generations", false, "quota", 429),
+        ] {
+            let mut payload = json!({"model":"gpt-image-2","prompt":prompt,"quality":"low","size":"1024x1024","background":"opaque","n":1});
+            if edit {
+                payload["images"] = json!([{"file_id":"file-fixture"}]);
+            }
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-codex-image-turn-id", "turn-fixture");
+            if let Some(key) = loop_key() {
+                builder = builder.header("authorization", format!("Bearer {key}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::from(payload.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response.headers()["x-codex-imagegen-request-id"],
+                "request-fixture"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if status == 200 {
+                assert_eq!(body["size"], "1254x1254");
+                assert_eq!(body["usage"]["output_tokens"], 515);
+            } else {
+                assert_eq!(body["error"]["code"], "image_generation_limit_reached");
+            }
+            let last = seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(last["body"], payload);
+            assert_eq!(last["account"], "acct-primary");
+            assert_eq!(last["authorization"], "Bearer synthetic-primary");
+            assert_eq!(last["turn"], "turn-fixture");
+            assert_eq!(
+                last["path"],
+                if edit {
+                    "/images/edits"
+                } else {
+                    "/images/generations"
+                }
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "no paid request may be replayed"
+        );
+        assert_eq!(
+            accounts.active_slot().await,
+            "primary",
+            "image quota does not park the text account"
+        );
+        let invalid = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"gpt-image-2","prompt":"","stream":true}).to_string(),
+            ))
+            .unwrap();
+        assert!(app
+            .oneshot(invalid)
+            .await
+            .unwrap()
+            .status()
+            .is_client_error());
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        task.abort();
+    }
+
     async fn http_post(root: &std::path::Path, upstream_url: String) -> (Response, AccountRouter) {
         chat_completions::set_test_upstream_url(Some(upstream_url));
         let accounts = AccountRouter::load(root).await.unwrap();
@@ -1173,7 +1377,7 @@ mod tests {
                 let stream = async_stream::stream! {
                     let _guard = Dropped(dropped);
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"visible\"}}\n\n",
+                    b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"visible\"}]}}\n\n",
                     ));
                     std::future::pending::<()>().await;
                 };

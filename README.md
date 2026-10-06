@@ -42,6 +42,28 @@ your behalf.
   directory next to the binary — never `~/.codex`, never the shell environment — and the
   API key your client presents is decorative.
 
+## Image generation and edits
+
+The standalone Codex Images API uses the same subscription login as text calls:
+`POST /v1/images/generations` and `POST /v1/images/edits` (the `/v1` prefix is optional).
+`GET /v1/images/models` lists the built-in image model separately from chat models.
+The initial model is `gpt-image-2`; account access is confirmed by a successful request,
+not by its presence in that list.
+
+```json
+{"model":"gpt-image-2","prompt":"A blue ceramic cup on a wooden table","n":1,"quality":"low","size":"1024x1024","background":"opaque"}
+```
+
+Edits add `"images":[{"image_url":"data:image/png;base64,..."}]` or a backend
+`file_id` and use the edits route. Responses preserve `data[].b64_json`, generation
+IDs, usage and the `x-codex-imagegen-request-id` header. Send a stable
+`x-codex-image-turn-id` for tracing. Decode the returned image to determine its actual
+dimensions; the requested size is not an output guarantee.
+
+An interrupted request is never automatically retried: it may already have generated
+an image. Image quota errors are returned intact and do not disable the account's text
+lane. Transport limits are 144 MiB per request, 64 MiB per response and 32 MiB per image.
+
 ## Quick start (Windows)
 
 Build the native executable (or take a prebuilt `praxis-relay.exe`):

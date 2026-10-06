@@ -14,6 +14,9 @@ RUN mkdir -p src && printf 'fn main(){}\n' > src/main.rs \
 COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
+FROM builder AS gate
+RUN cargo test --no-run --locked
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates curl \
