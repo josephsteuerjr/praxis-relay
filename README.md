@@ -15,7 +15,8 @@ your behalf.
 ## Why it is more than a proxy
 
 - **It meets clients where they are.** Chat Completions answers with and without the `/v1`
-  prefix; `"stream": true` gets SSE, everything else gets one aggregated JSON response.
+  prefix. Text calls return SSE; configure your chat client with `"stream": true`.
+  Standalone image calls return final JSON.
   And it impersonates a llama.cpp-style "local model" server well enough that frameworks
   with a local-llama lane plug in unmodified: the context window is advertised under every
   field name such clients read (`meta.n_ctx_train`, `context_window`, `context_length`),
