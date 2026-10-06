@@ -291,6 +291,10 @@ fn app_router(app_state: AppState) -> Router {
             "/chat/completions",
             post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
         )
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
+        )
         .route("/v1/models", get(models_handler))
         .route(
             "/v1/images/generations",
