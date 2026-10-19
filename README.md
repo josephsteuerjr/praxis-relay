@@ -5,7 +5,7 @@ OpenAI-compatible LLM API** — a frontier-model brain for any agent framework, 
 subscription price.
 
 Point your agent at `http://127.0.0.1:5011/v1`, select a model listed by `GET /v1/models`,
-and enable streaming. The relay provides tool calling, vision input, and usage accounting
+and choose streaming or a final JSON response. The relay provides tool calling, vision input, and usage accounting
 through your own ChatGPT subscription. It signs in once and speaks the Codex protocol to
 the backend on your behalf; a separate OpenAI API account is not required.
 
@@ -18,8 +18,8 @@ The local Bearer key and the ChatGPT subscription login are separate credentials
 ## Why it is more than a proxy
 
 - **It meets clients where they are.** Chat Completions answers with and without the `/v1`
-  prefix. Text calls return SSE; configure your chat client with `"stream": true`.
-  Standalone image calls return final JSON.
+  prefix. Chat calls return SSE with `"stream": true`, or one final JSON completion
+  with `false` or an omitted flag. Standalone image calls return final JSON.
   And it impersonates a llama.cpp-style "local model" server well enough that frameworks
   with a local-llama lane plug in unmodified: the context window is advertised under every
   field name such clients read (`meta.n_ctx_train`, `context_window`, `context_length`),
@@ -124,8 +124,8 @@ request retries once on the full preamble rather than failing.
 ## Endpoints
 
 - `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions over
-  SSE. Configure clients with `"stream": true`; this implementation returns a stream
-  even when the request omits that flag. Tool calls and image input are supported.
+  SSE when `"stream": true`; otherwise one `application/json` Chat completion.
+  Tool calls, image input and optional measured usage are preserved in either mode.
 - `GET /v1/models` — the models the backend serves this
   subscription right now, read from its own catalog (see below): today
   `gpt-6-astra`, `gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
@@ -245,9 +245,12 @@ The relay can stand in for a llama.cpp-style localhost server, so agent framewor
 - The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
   which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
   still a 404 against the live catalog, so typos in real model names keep failing loudly.
-- Chat calls return SSE; enable `"stream": true` in the client. A successful response
-  finishes its choice with `stop` or `tool_calls`, then closes the stream. The adapter
-  does not emit a separate `[DONE]` event.
+- Chat calls honor `stream`: true returns SSE; false or omitted returns final JSON.
+  Successful choices finish with `stop` or `tool_calls`. SSE closes without a separate
+  `[DONE]` event. JSON failures retain a top-level `error` and optional `relay_terminal`
+  under HTTP 200 (as SSE terminals do), never partial executable tool calls or diagnostic
+  text as a successful answer. Missing usage stays absent. Dropping either response body
+  cancels the same upstream request; aggregation never starts a second generation.
 - Function tools retain the parameters provided by the client. Missing or null `strict`
   maps to `false`; explicit `true` and `false` are preserved. The relay does not rewrite
   optional properties, add `additionalProperties: false`, or make every property required.
