@@ -282,7 +282,8 @@ as the MIT license requires.
 Parts of the sign-in path and `src/core/prompt.md` descend, through that upstream, from the
 [OpenAI Codex CLI](https://github.com/openai/codex) (Apache-2.0, Copyright 2025 OpenAI).
 [NOTICE](NOTICE) names those files and states that they were modified, as Apache-2.0
-requires of anyone redistributing them.
+requires of anyone redistributing them. The full license is in
+[LICENSE-APACHE](LICENSE-APACHE); keep both licenses and NOTICE when distributing bundles.
 
 This project is independently maintained and is not affiliated with or endorsed by OpenAI.
 It speaks the Codex protocol to the ChatGPT backend; treat it as an unofficial bridge and

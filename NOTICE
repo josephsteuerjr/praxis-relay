@@ -8,8 +8,8 @@ unluckyjori, licensed under the MIT License. See LICENSE.
 
 Portions of this software are derived from the OpenAI Codex CLI
 (https://github.com/openai/codex), Copyright 2025 OpenAI, licensed under the
-Apache License, Version 2.0. A copy of that license is available at
-http://www.apache.org/licenses/LICENSE-2.0
+Apache License, Version 2.0. See the included LICENSE-APACHE for its full text
+(also available at https://www.apache.org/licenses/LICENSE-2.0).
 
 The following files are derived from that project and have been modified:
 
