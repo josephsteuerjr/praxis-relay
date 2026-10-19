@@ -69,9 +69,9 @@ where
         for choice in event.choices {
             if let Some(reason) = choice.finish_reason.as_deref() {
                 if !matches!(reason, "stop" | "tool_calls" | "length" | "content_filter") {
-                    failure = Some(
-                        json!({"code":reason, "message":"Upstream completion failed", "type":"relay_error"}),
-                    );
+                    failure = Some(json!({"code":reason,
+                            "message":choice.delta.content.as_deref().unwrap_or("Upstream completion failed"),
+                            "type":"relay_error"}));
                     break;
                 }
                 finish = Some(reason.to_string());

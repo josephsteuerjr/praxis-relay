@@ -293,3 +293,46 @@ async fn dropping_json_client_before_first_byte_cancels_upstream() {
     upstream_task.abort();
     chat_completions::set_test_upstream_url(None);
 }
+
+#[tokio::test]
+async fn json_error_keeps_legacy_diagnosis_and_typed_attempts_out_of_assistant_text() {
+    use crate::core::models::ResponseEvent;
+    for terminal in [
+        None,
+        Some(
+            json!({"code":"mixed_account_failure", "message":"quota then auth",
+        "attempts":[{"slot":"primary","code":"quota_exhausted","status":429,"resets_at":12345},
+                    {"slot":"secondary","code":"auth_failed","status":401}]}),
+        ),
+    ] {
+        let mut raw = json!({"id":"failure","object":"chat.completion.chunk","created":1,
+            "model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"role":"assistant",
+                "content":"401: subscription credentials require login"},"finish_reason":"error"}],
+            "usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}});
+        if let Some(value) = terminal.clone() {
+            raw["relay_terminal"] = value;
+        }
+        let event: ResponseEvent = serde_json::from_value(raw).unwrap();
+        let response = crate::chat_response::json_response(
+            futures::stream::iter(vec![Ok(event)]),
+            "gpt-5.6-sol".into(),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 100000)
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(output["choices"][0]["message"]["content"].is_null());
+        assert_eq!(output["choices"][0]["finish_reason"], "error");
+        assert_eq!(output["usage"]["total_tokens"], 8);
+        if terminal.is_some() {
+            assert_eq!(output["relay_terminal"]["attempts"][0]["status"], 429);
+            assert_eq!(output["relay_terminal"]["attempts"][1]["status"], 401);
+            assert_eq!(output["error"]["message"], "quota then auth");
+        } else {
+            assert_eq!(
+                output["error"]["message"],
+                "401: subscription credentials require login"
+            );
+        }
+    }
+}
