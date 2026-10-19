@@ -4,11 +4,14 @@ One small binary that turns a **ChatGPT subscription** (Plus/Pro) into a **local
 OpenAI-compatible LLM API** — a frontier-model brain for any agent framework, at a flat
 subscription price.
 
-Point your agent at `http://127.0.0.1:5011/v1` with any placeholder string as the API key,
-and it talks to the GPT-5.6 family with tool calling, vision input, streaming, and real
-usage accounting. No OpenAI API account, no per-token billing, no key to leak. The relay
-signs into your own ChatGPT account once and speaks the Codex protocol to the backend on
-your behalf.
+Point your agent at `http://127.0.0.1:5011/v1`, select a model listed by `GET /v1/models`,
+and enable streaming. The relay provides tool calling, vision input, and usage accounting
+through your own ChatGPT subscription. It signs in once and speaks the Codex protocol to
+the backend on your behalf; a separate OpenAI API account is not required.
+
+With `RELAY_API_KEY` unset, the client may use a placeholder API key. If the relay or its
+host application sets `RELAY_API_KEY`, use that exact value as the client's API key.
+The local Bearer key and the ChatGPT subscription login are separate credentials.
 
 Русская памятка по запуску — [ПАМЯТКА.md](ПАМЯТКА.md).
 
@@ -21,12 +24,14 @@ your behalf.
   with a local-llama lane plug in unmodified: the context window is advertised under every
   field name such clients read (`meta.n_ctx_train`, `context_window`, `context_length`),
   and the `local-model` slug those clients hardcode resolves to a configurable real model.
-- **Arbitrary tool schemas survive the strict backend.** The subscription backend validates
-  function schemas against a strict subset — `additionalProperties: false`, an exhaustive
-  `required`, a `type` on every node — that ordinary framework registries and MCP servers
-  do not speak, and one non-conforming function fails the whole request. The relay rewrites
-  every schema on the fly, preserving optionality through nullable types. Proven live on an
-  agent turn carrying 98 tools.
+- **Ordinary Chat tool schemas keep their semantics.** Missing or null `strict` stays
+  non-strict, so optional properties and open objects are forwarded without silently
+  enabling stricter validation. Explicit `strict: true` or `false` is preserved, along
+  with the caller's parameters; an opted-in strict schema must satisfy upstream rules.
+- **A successful stream finishes its Chat choice.** The upstream completion produces
+  `finish_reason: "stop"` or `"tool_calls"`, including responses with no final output or
+  usage object. Suppressing repeated final text keeps the finish reason and usage.
+  Finished tool items alone do not mark a response successful before upstream completes.
 - **Subscription-grade resilience.** Two account slots with automatic failover when a quota
   runs out, bounded cooldowns, deliberate switching over the API, token refresh driven by
   the token's actual expiry, and machine-readable terminal errors that distinguish "quota
@@ -39,9 +44,10 @@ your behalf.
 - **The answer is the model's text, not the transport's.** Streaming text is taken from the
   finished message item with its annotations, so inline citation markers and tracking
   parameters do not leak into what the model actually said.
-- **Private by construction.** The server binds to loopback only. Credentials live in one
-  directory next to the binary — never `~/.codex`, never the shell environment — and the
-  API key your client presents is decorative.
+- **Local access is configurable.** The server binds to loopback only. Set `RELAY_API_KEY`
+  to require a matching Bearer credential for generation calls. Use `RELAY_LOCAL=1` when
+  signing in to keep relay credentials under `./local_auth` in its working directory;
+  without that flag, login can use the existing Codex/OpenCode credential locations.
 
 ## Image generation and edits
 
@@ -67,11 +73,12 @@ lane. Transport limits are 144 MiB per request, 64 MiB per response and 32 MiB p
 
 ## Quick start (Windows)
 
-Build the native executable (or take a prebuilt `praxis-relay.exe`):
+Build the native executable:
 
 ```powershell
 cargo build --release --locked
 Copy-Item .\target\release\codex-proxy-server.exe .\praxis-relay.exe
+$env:RELAY_LOCAL = "1"
 .\praxis-relay.exe
 ```
 
@@ -116,10 +123,10 @@ request retries once on the full preamble rather than failing.
 
 ## Endpoints
 
-- `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions,
-  streaming (SSE) when the request carries `"stream": true`, a single aggregated
-  `chat.completion` JSON object otherwise. Tool calls and image input are supported.
-- `GET /v1/models` (alias: `GET /models`) — the models the backend serves this
+- `POST /chat/completions` (alias: `POST /v1/chat/completions`) — Chat Completions over
+  SSE. Configure clients with `"stream": true`; this implementation returns a stream
+  even when the request omits that flag. Tool calls and image input are supported.
+- `GET /v1/models` — the models the backend serves this
   subscription right now, read from its own catalog (see below): today
   `gpt-6-astra`, `gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
   `gpt-5.3-codex-spark`, each with its context window, input modalities and
@@ -177,13 +184,17 @@ conversation. Treat it as a fast lane, not a default.
   By default each model carries the number the backend reports for it (272000 today);
   `400000` stands in for slugs the catalog does not describe. Advisory metadata for
   clients; the real limit is enforced upstream.
-- `RELAY_CODEX_VERSION` — the Codex CLI version presented upstream, default `0.153.3`.
-  The backend lists a new model only to clients at or above its minimal version.
+- `RELAY_CODEX_VERSION` — explicit override for the Codex CLI version presented upstream.
+  When unset, startup looks up the latest Codex version and falls back to its built-in
+  version if discovery fails. The backend can gate model visibility on this version.
 - `RELAY_MODELS_TTL` — seconds between model-catalog refreshes, default `600`.
 - `RELAY_EXTRA_MODELS` — comma-separated slugs accepted and advertised on top of the
   catalog (a slug the backend hides, or one it lists only for a newer client).
 - `RELAY_MODEL_DISCOVERY` — `off` serves the built-in list only and never asks the backend.
-- `RELAY_AUTH_DIR` — credential directory, default `local_auth` next to the executable.
+- `RELAY_LOCAL` — set to `1` when signing in to store credentials under `./local_auth`
+  in the working directory. Serving prefers that directory when an auth file exists.
+- `RELAY_API_KEY` — optional local Bearer key required by generation endpoints when set.
+  With it unset, client API keys are not checked. This does not replace subscription login.
 - `RELAY_PYTHON` — explicit Python 3 interpreter for the login helper.
 - `RELAY_REASONING_EFFORT` — default reasoning effort applied when a request carries none
   (`none` by default; requests may override via their own `reasoning_effort` field).
@@ -203,11 +214,15 @@ conversation. Treat it as a fast lane, not a default.
 
 ## Separate relay authentication
 
-The relay never reads `~/.codex/auth.json` or `~/.opencode/auth.json`. Its credentials live
-only in `local_auth/auth.json` next to the executable (or `RELAY_AUTH_DIR`).
+For a separate relay login, set `RELAY_LOCAL=1`, start the executable from its own
+working directory, and choose menu option `3` to authorize, then `1` to serve the API.
+Login writes `./local_auth/auth.json`; serving prefers that local directory when its auth
+file exists. Without the local-login flag, the legacy login flow can use `~/.codex` or
+`~/.opencode`. Keep the working directory consistent between login and serving.
 
-On a clean installation, start the executable and choose menu option `3` to authorize the
-relay account, then `1` to serve the API.
+If `RELAY_API_KEY` is set, clients must present it as `Authorization: Bearer <key>`.
+Otherwise a placeholder client key is accepted. This local key is independent of the
+subscription credentials stored by login.
 
 ### Multi-account
 
@@ -230,27 +245,23 @@ The relay can stand in for a llama.cpp-style localhost server, so agent framewor
 - The exact model slug `local-model` — hardcoded by clients built against llama-cpp-python,
   which ignores the field — resolves to `RELAY_DEFAULT_MODEL`. Any other unknown slug is
   still a 404 against the live catalog, so typos in real model names keep failing loudly.
-- Requests without `"stream": true` get a single aggregated JSON response.
-- `tool_choice` travels through — `"required"`, `"none"`, and named-function forms included
-  (the Chat-Completions `{"type":"function","function":{"name":…}}` shape is reshaped for
-  the Responses API), so a client's mandatory tool call stays mandatory. `response_format`
-  maps to the Responses `text.format`: `json_object` and flattened `json_schema` (whose
-  schema passes the same strictifier). Both verified live.
-- Function tools are sent upstream with `strict: true` (the relay default), and every tool
-  schema is normalized to the strict subset the backend validates: `additionalProperties:
-  false` plus a full `required` on every object, a `type` synthesized for shapeless nodes
-  (a bare `{}` becomes `"string"`; enums infer from their members), with original
-  optionality preserved by adding `null` to the type — and to the enum — of properties that
-  were not originally required. A client that explicitly sets `strict: false` on a function
-  gets its schema forwarded untouched.
+- Chat calls return SSE; enable `"stream": true` in the client. A successful response
+  finishes its choice with `stop` or `tool_calls`, then closes the stream. The adapter
+  does not emit a separate `[DONE]` event.
+- Function tools retain the parameters provided by the client. Missing or null `strict`
+  maps to `false`; explicit `true` and `false` are preserved. The relay does not rewrite
+  optional properties, add `additionalProperties: false`, or make every property required.
+- Tool selection currently uses `auto`. Chat `tool_choice` constraints and
+  `response_format` translation are not implemented by this adapter.
 
 The Ollama-native protocol (`/api/tags`, `/api/chat`) is not spoken; use a framework's
 OpenAI-compatible mode.
 
 ## Authentication and privacy
 
-The relay reads authentication only from its dedicated auth directory. Never commit
-`auth.json`, API keys, session files, or relay logs. This repository contains source code
+Use `RELAY_LOCAL=1` during login for credentials dedicated to the relay. Serving prefers
+existing local credentials and otherwise checks legacy Codex/OpenCode locations. Never
+commit `auth.json`, API keys, session files, or relay logs. This repository contains source code
 only; it deliberately contains no account data.
 
 ## License and provenance
