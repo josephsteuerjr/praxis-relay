@@ -13,6 +13,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Modules
+mod chat_response;
+#[cfg(test)]
+mod chat_response_tests;
 mod core;
 mod login;
 #[cfg(target_family = "windows")]
@@ -995,7 +998,9 @@ async fn chat_completions_handler(
             .into_response());
     }
 
-    // Process the chat completion
+    // Upstream always streams; the caller chooses the downstream wire format.
+    let streaming = request.stream;
+    let response_model = request.model.clone();
     match chat_completions::stream_chat_completions(
         &state.config,
         state.accounts.clone(),
@@ -1005,6 +1010,12 @@ async fn chat_completions_handler(
     .await
     {
         Ok(response_stream) => {
+            if !streaming {
+                return Ok(chat_response::json_response(
+                    response_stream,
+                    response_model,
+                ));
+            }
             info!("✅ Chat completion stream started successfully");
             // Convert the response stream to SSE
             let sse_stream = response_stream.map(|result| {
@@ -1218,7 +1229,7 @@ mod tests {
             .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(
-                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]})
+                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}],"stream":true})
                     .to_string(),
             ))
             .unwrap();
@@ -1418,7 +1429,7 @@ mod tests {
             .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(
-                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]})
+                json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}],"stream":true})
                     .to_string(),
             ))
             .unwrap();
