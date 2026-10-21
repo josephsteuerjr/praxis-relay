@@ -45,7 +45,7 @@ jobs:
         run: |
           New-Item -ItemType Directory package | Out-Null
           Copy-Item target/release/praxis-relay-headless.exe,target/release/praxis-relay-desktop.exe package/
-          Copy-Item README.md,РџРђРњРЇРўРљРђ.md,LICENSE,LICENSE-APACHE,NOTICE package/
+          Copy-Item README.md,ПАМЯТКА.md,LICENSE,LICENSE-APACHE,NOTICE package/
           $files = Get-ChildItem package -File | ForEach-Object { @{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()} }
           @{version='1.0.0';commit='${{ github.sha }}';target='x86_64-pc-windows-msvc';files=$files;limits=@('Real browser OAuth and native tray interaction require separate acceptance')} | ConvertTo-Json -Depth 5 | Set-Content package/BUILD-PASSPORT.json -Encoding utf8
       - uses: actions/upload-artifact@v7
