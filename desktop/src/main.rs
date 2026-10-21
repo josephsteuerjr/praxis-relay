@@ -94,32 +94,19 @@ fn main() {
                     ))?;
                 }
             }
-            let open = MenuItem::with_id(app, "open", "Открыть Praxis Relay", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "Открыть praxis-relay", true, None::<&str>)?;
             let quit =
                 MenuItem::with_id(app, "quit", "Выйти и остановить реле", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
-            let mut rgba = vec![0u8; 32 * 32 * 4];
-            for y in 0..32 {
-                for x in 0..32 {
-                    let i = (y * 32 + x) * 4;
-                    let inside = (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 210;
-                    rgba[i..i + 4].copy_from_slice(if inside {
-                        &[224, 145, 90, 255]
-                    } else {
-                        &[0, 0, 0, 0]
-                    });
-                    if (x > 12 && x < 19 && y > 6 && y < 26)
-                        || (y > 12 && y < 19 && x > 6 && x < 26)
-                    {
-                        rgba[i..i + 4].copy_from_slice(&[29, 26, 23, 255]);
-                    }
-                }
-            }
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("The application icon is missing"))?;
             // If creating the tray fails, startup fails visibly instead of
             // allowing the window to hide somewhere the user cannot restore it.
             TrayIconBuilder::with_id("relay")
-                .icon(tauri::image::Image::new_owned(rgba, 32, 32))
-                .tooltip("Praxis Relay")
+                .icon(icon)
+                .tooltip("praxis-relay")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {

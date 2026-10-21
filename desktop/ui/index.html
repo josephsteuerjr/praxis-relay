@@ -3,13 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Praxis Relay</title>
+    <title>praxis-relay</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <div id="titlebar">
-      <span class="window-name">praxis / relay</span
-      ><span class="drag-hint">Локальная связь</span>
       <div class="window-controls">
         <button
           data-window="minimize"
@@ -36,13 +34,11 @@
     </div>
     <aside>
       <div class="brand">
-        <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
-          <path
-            d="M7 24h11m12 0h11M24 7v11m0 12v11M12 12l8 8m8 8 8 8M12 36l8-8m8-8 8-8"
-          />
-          <circle cx="24" cy="24" r="8" />
-        </svg>
-        <div><strong>Relay</strong><small>из мастерской Праксис</small></div>
+        <img class="brand-mark" src="icon.svg" alt="" />
+        <div>
+          <strong>praxis-relay</strong
+          ><small id="sidebar-version">v.1.0.0</small>
+        </div>
       </div>
       <nav aria-label="Разделы">
         <button
@@ -82,20 +78,15 @@
           ><span>Настройки</span><kbd>,</kbd>
         </button>
       </nav>
-      <div class="sidebar-note">
-        Подписка остаётся твоей.<br />Инструменты выбираешь ты.
-      </div>
       <div class="sidebar-bottom">
         <span id="sidebar-dot" class="dot"></span
-        ><span id="sidebar-status">Подключаемся…</span
-        ><small id="sidebar-version">Praxis Relay</small>
+        ><span id="sidebar-status">Подключаемся…</span>
       </div>
     </aside>
     <main>
       <header class="page-header">
         <div>
-          <span class="eyebrow" id="page-kicker">ТВОЯ МАСТЕРСКАЯ</span>
-          <h1 id="page-title">Всё связано</h1>
+          <h1 id="page-title">Главная</h1>
         </div>
         <div class="server-control">
           <span id="server-badge" class="status">Проверка…</span
@@ -123,29 +114,6 @@
         <button id="cancel-login">Отменить</button>
       </div>
       <section class="page" id="overview">
-        <div class="welcome">
-          <div>
-            <span class="eyebrow">CHATGPT → ТВОИ ПРИЛОЖЕНИЯ</span>
-            <h2>Хорошим идеям<br />нужна связь.</h2>
-            <p>
-              Текст, инструменты, вижен и картинки.<br />Один адрес на твоём
-              компьютере.
-            </p>
-          </div>
-          <svg
-            class="connection-drawing"
-            viewBox="0 0 240 150"
-            aria-hidden="true"
-          >
-            <path d="M19 80c27-34 53 36 84-6s56-37 70-5 35 15 49-14" />
-            <rect x="11" y="54" width="34" height="46" rx="9" />
-            <rect x="184" y="38" width="42" height="58" rx="9" />
-            <circle cx="119" cy="69" r="20" />
-            <path
-              d="m111 69 6 6 12-13M27 48v-8m173-9 3-11m27 22 10-5M60 111l6 7m87-90 6-7"
-            />
-          </svg>
-        </div>
         <div class="section-heading">
           <h2>Подключение</h2>
           <span class="muted" id="connection-state">API остановлен</span>
@@ -173,7 +141,7 @@
           </div>
         </div>
         <div class="section-heading">
-          <h2>Твои подписки</h2>
+          <h2>Подписки</h2>
           <button class="link" data-go="accounts">Открыть квоты ↗</button>
         </div>
         <div id="overview-accounts" class="account-grid"></div>
@@ -227,8 +195,8 @@
         </p>
         <div class="settings-panel" id="settings-look" role="tabpanel">
           <div class="setting-group">
-            <h2>Твоя бумага и чернила</h2>
-            <p>Тот же характер, что у Hélène. Настрой под себя.</p>
+            <h2>Цвета</h2>
+
             <div class="setting-row">
               <label for="theme">Тема</label
               ><select id="theme" data-setting="appearance.theme">
@@ -266,7 +234,7 @@
             ></div>
           </div>
           <div class="setting-group">
-            <h2>Ритм интерфейса</h2>
+            <h2>Отображение</h2>
             <div class="setting-row">
               <label for="scale">Размер текста</label
               ><select id="scale" data-setting="appearance.scale" data-number>
@@ -284,10 +252,7 @@
               </select>
             </div>
             <label class="check-row"
-              ><span
-                >Рукописные заголовки<small
-                  >Zen Kurenaido, как у Hélène</small
-                ></span
+              ><span>Рукописные заголовки<small>Zen Kurenaido</small></span
               ><input
                 type="checkbox"
                 data-setting="appearance.handwritten"
@@ -392,7 +357,7 @@
         <div class="settings-panel" id="settings-model" role="tabpanel" hidden>
           <div id="environment-note" class="info-note" hidden></div>
           <div class="setting-group">
-            <h2>Если приложение не указало своё</h2>
+            <h2>Параметры по умолчанию</h2>
             <p>
               Параметры из запроса приложения имеют приоритет. Сохранённые
               значения применяются при запуске API.
@@ -454,7 +419,7 @@
                 <option value="minimal">Короткий нейтральный</option>
               </select>
             </div>
-            <label for="instructions">Твои дополнения</label
+            <label for="instructions">Дополнительные инструкции</label
             ><textarea
               id="instructions"
               data-setting="defaults.instructions"
@@ -469,14 +434,14 @@
         </div>
         <div class="settings-panel" id="settings-data" role="tabpanel" hidden>
           <div class="setting-group">
-            <h2>Всё рядом с реле</h2>
+            <h2>Хранилище и версии</h2>
             <label>Хранилище</label><code id="auth-dir" class="path"></code>
             <p>
               Входы, ключ и настройки находятся в этой папке. Обновление
               программы сохраняет их.
             </p>
             <div class="data-row">
-              <span>Praxis Relay</span><strong id="app-version"></strong>
+              <span>praxis-relay</span><strong id="app-version"></strong>
             </div>
             <div class="data-row">
               <span>Версия протокола Codex</span

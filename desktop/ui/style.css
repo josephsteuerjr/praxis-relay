@@ -180,13 +180,7 @@ label {
 small {
   font-size: 0.8rem;
 }
-.eyebrow {
-  font-size: 0.68rem;
-  letter-spacing: 0.14em;
-  color: var(--muted);
-  display: block;
-  margin-bottom: 10px;
-}
+
 #titlebar {
   grid-area: title;
   display: flex;
@@ -196,17 +190,7 @@ small {
   user-select: none;
   gap: 18px;
 }
-.window-name {
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-}
-.drag-hint {
-  font-size: 11px;
-  color: var(--muted);
-  flex: 1;
-  text-align: center;
-}
+
 .window-controls {
   align-self: stretch;
   display: flex;
@@ -240,25 +224,28 @@ aside {
 .brand {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 0 0 38px 6px;
+  gap: 10px;
+  margin: 0 0 38px;
 }
 .brand-mark {
-  width: 38px;
-  height: 38px;
+  width: 30px;
+  height: 30px;
   color: var(--accent);
   flex-shrink: 0;
   stroke-width: 1.6;
 }
 .brand strong {
-  font: 2.4rem/1 var(--hand);
+  font:
+    550 1.03rem/1.2 Golos,
+    "Segoe UI",
+    sans-serif;
   display: block;
 }
 .brand small {
-  font-size: 0.65rem;
+  font-size: 8px;
   color: var(--muted);
   display: block;
-  margin-top: 8px;
+  margin-top: 5px;
 }
 .brand div {
   min-width: 0;
@@ -300,23 +287,14 @@ nav kbd {
   font: 10px Golos;
   opacity: 0.45;
 }
-.sidebar-note {
-  font: 1.1rem/1.6 var(--hand);
-  color: var(--muted);
-  margin-top: auto;
-  padding: 40px 10px 24px;
-}
+
 .sidebar-bottom {
+  margin-top: auto;
   padding: 16px 7px 0;
   border-top: 1px solid var(--line);
   font-size: 0.75rem;
 }
-.sidebar-bottom small {
-  display: block;
-  font-size: 0.65rem;
-  color: var(--muted);
-  margin: 8px 0 0 13px;
-}
+
 .dot {
   display: inline-block;
   width: 6px;
@@ -374,32 +352,7 @@ main {
     transform: none;
   }
 }
-.welcome {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  min-height: 190px;
-  padding: 12px 0 24px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 24px;
-}
-.welcome h2 {
-  font-size: 2.65rem;
-  line-height: 1.15;
-}
-.welcome p {
-  font-size: 0.88rem;
-  color: var(--muted);
-  margin: 14px 0 0;
-}
-.connection-drawing {
-  width: 220px;
-  max-width: 35%;
-  color: var(--accent);
-  stroke-width: 1.7;
-  transform: rotate(-5deg);
-  margin-right: 10px;
-}
+
 .section-heading {
   display: flex;
   justify-content: space-between;
@@ -864,13 +817,7 @@ textarea {
 body[data-density="compact"] main {
   padding-top: 20px;
 }
-body[data-density="compact"] .welcome {
-  min-height: 140px;
-  padding-top: 0;
-}
-body[data-density="compact"] .welcome h2 {
-  font-size: 2.2rem;
-}
+
 body[data-density="compact"] .account,
 body[data-density="compact"] .connection {
   padding: 15px;
@@ -945,9 +892,7 @@ body[data-motion="false"] *:after {
   .active-label {
     font-size: 0.55rem;
   }
-  .connection-drawing {
-    max-width: 29%;
-  }
+
   .palette-row {
     gap: 26px;
   }
@@ -964,7 +909,6 @@ body[data-motion="false"] *:after {
   }
   .brand div,
   nav span,
-  .sidebar-note,
   .sidebar-bottom {
     display: none;
   }
@@ -984,9 +928,7 @@ body[data-motion="false"] *:after {
   .account-grid {
     grid-template-columns: 1fr;
   }
-  .welcome h2 {
-    font-size: 2.3rem;
-  }
+
   .page-intro {
     align-items: flex-start;
     flex-direction: column;
@@ -1011,8 +953,5 @@ body[data-motion="false"] *:after {
   }
   .banner {
     flex-wrap: wrap;
-  }
-  .drag-hint {
-    display: none;
   }
 }

@@ -29,10 +29,10 @@ const accents = {
   cinnabar: ["Киноварь", "#d9674e", "#9a3420", "#ee9a86"],
 };
 const titles = {
-  overview: ["Всё связано", "ТВОЯ МАСТЕРСКАЯ"],
-  accounts: ["Твои подписки", "АККАУНТЫ И КВОТЫ"],
-  activity: ["По ходу дела", "СОБЫТИЯ РЕЛЕ"],
-  settings: ["По твоим правилам", "НАСТРОЙКИ"],
+  overview: ["Главная"],
+  accounts: ["Подписки"],
+  activity: ["События"],
+  settings: ["Настройки"],
 };
 let state = null,
   busy = false,
@@ -120,7 +120,6 @@ function page(id) {
     );
   }
   $("page-title").textContent = titles[id][0];
-  $("page-kicker").textContent = titles[id][1];
   document.querySelector("main").scrollTop = 0;
   try {
     localStorage.setItem("relay.page", id);
@@ -312,7 +311,7 @@ function render(next) {
     state.login.slot
   )
     delete limits[state.login.slot];
-  $("sidebar-version").textContent = `Praxis Relay ${state.version}`;
+  $("sidebar-version").textContent = `v.${state.version}`;
   $("sidebar-status").textContent = state.running
     ? "API работает"
     : "API остановлен";
