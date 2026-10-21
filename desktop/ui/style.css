@@ -445,6 +445,21 @@ h2{
   color:#b36767;
   line-height:1.6
 }
+.error-details{
+  margin-top:9px;
+  font-size:10px;
+  color:#858a9a
+}
+.error-details summary{
+  cursor:pointer
+}
+.error-details pre{
+  max-height:160px;
+  overflow:auto;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  font-size:10px
+}
 .events{
   overflow:hidden
 }

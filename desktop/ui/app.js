@@ -3,7 +3,21 @@ const $=id=>document.getElementById(id);
 const escape=s=>String(s??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state=null,busy=false,lastAccounts="",lastEvents="",limits={},identities={};
 const titles={overview:"Всё под рукой",accounts:"Аккаунты и квоты",activity:"События реле",settings:"Настройки"};
-function notice(message){$("notice").textContent=message||"";$("notice").hidden=!message;}
+function problem(error){
+  const raw=String(error);
+  let message="Не удалось выполнить действие. Попробуй ещё раз; причина указана в подробностях.";
+  if(/^[А-ЯЁ]/.test(raw))message=raw;
+  else if(/OpenAI usage endpoint returned (401|403)/.test(raw))message="Не удалось подтвердить сессию. Войди в эту подписку заново.";
+  else if(/OpenAI usage request failed/.test(raw))message="Не удалось получить квоты. Проверь подключение к интернету и попробуй ещё раз.";
+  else if(/Python 3\.10\+|Windows Store aliases/.test(raw))message="Для входа нужен рабочий Python 3.10 или новее. Установи Python или укажи его путь в RELAY_PYTHON.";
+  else if(/Port \d+ is already in use/.test(raw))message="Порт занят другой программой. Выбери свободный порт в настройках.";
+  else if(/WinError 10048|Address already in use|address already in use/.test(raw))message="Порт для входа занят. Заверши попытку входа в другой программе и повтори.";
+  else if(/not writable|Permission denied|Access is denied|Отказано в доступе|PermissionError/.test(raw))message="Не удалось записать данные реле. Перенеси его папку в доступное для записи место и повтори.";
+  else if(/Login timed out/.test(raw))message="Время ожидания входа истекло. Начни вход заново.";
+  else if(/login is already in progress/i.test(raw))message="Вход уже начат. Заверши его в браузере или нажми «Отменить».";
+  return `<div>${escape(message)}</div>${message===raw?"":`<details class="error-details"><summary>Технические подробности</summary><pre>${escape(raw)}</pre></details>`}`;
+}
+function notice(message){$("notice").innerHTML=message?problem(message):"";$("notice").hidden=!message;}
 async function invoke(op,slot=null,port=null){return window.__TAURI__.core.invoke("relay_command",{op,slot,port});}
 function page(id){for(const node of document.querySelectorAll(".page"))node.hidden=node.id!==id;for(const node of document.querySelectorAll("nav button"))node.classList.toggle("selected",node.dataset.page===id);$("page-title").textContent=titles[id];}
 function quotaWindow(window,label){
@@ -16,7 +30,7 @@ function quotaPanel(slot){
   const result=limits[slot];
   if(!result)return `<div class="quota-note">Нажми «Проверить квоты», чтобы получить данные подписки.</div>`;
   if(result.loading)return `<div class="quota-note">Проверяем квоты…</div>`;
-  if(result.error)return `<div class="quota-error">${escape(result.error)}</div>`;
+  if(result.error)return `<div class="quota-error">${problem(result.error)}</div>`;
   let html=quotaWindow(result.rate_limit?.primary_window,"Основное окно")+quotaWindow(result.rate_limit?.secondary_window,"Недельное окно");
   for(const extra of result.additional_rate_limits||[]){html+=`<div class="quota-note">${escape(extra.limit_name||extra.name||"Дополнительная квота")}</div>`+quotaWindow(extra.rate_limit?.primary_window,"Основное окно")+quotaWindow(extra.rate_limit?.secondary_window,"Недельное окно");}
   if(result.fetched_at)html+=`<div class="quota-note">Обновлено ${escape(new Date(result.fetched_at).toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}))}</div>`;
