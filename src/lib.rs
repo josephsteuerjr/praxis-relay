@@ -16,6 +16,7 @@ mod chat_response;
 mod chat_response_tests;
 mod core;
 mod login;
+mod local_key;
 pub mod service;
 
 use core::account_router::AccountRouter;
@@ -27,6 +28,9 @@ use core::models::{ChatRequest, ModelList, MAX_CHAT_REQUEST_BYTES};
 
 #[derive(Clone)]
 struct AppState {
+    // Real service instances always set this. Isolated protocol fixtures may
+    // omit it to exercise upstream behavior independently of client auth.
+    api_key: Option<Arc<str>>,
     config: Arc<Config>,
     accounts: AccountRouter,
     limits: LimitsCache,
@@ -163,7 +167,7 @@ async fn account_switch_handler(
     headers: HeaderMap,
     payload: Result<Json<AccountSwitchRequest>, JsonRejection>,
 ) -> Response {
-    if headers.contains_key("origin") || !key_ok(&headers) {
+    if headers.contains_key("origin") || !key_ok(&headers, state.api_key.as_deref()) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error":{"code":"account_control_forbidden"}})),
@@ -219,28 +223,9 @@ async fn account_switch_handler(
     }
 }
 
-/// Ключ петли к реле: `RELAY_API_KEY`. Задан — вызов модели обязан принести его
-/// Bearer-ом; пусто — проверки нет вовсе (так живёт её серверное реле, у
-/// которого порт не выходит за контейнер).
-///
-/// Обещание было старше проверки. Оболочка Hélène передаёт ключ этой
-/// переменной с 0.4.x, установщик пишет в helene.json `sk-frame-…` и объясняет
-/// в коде: «открытый локальный порт позволял бы любому процессу на машине жечь
-/// подписку владельца». Реле переменную не читало, и любой процесс мог.
-fn loop_key() -> Option<&'static str> {
-    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        std::env::var("RELAY_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
-    .as_deref()
-}
-
-/// Принёс ли запрос ключ петли. Нет ключа в среде — пускаем всех, как раньше.
-fn key_ok(headers: &HeaderMap) -> bool {
-    let Some(key) = loop_key() else { return true };
+/// Verify the installation's client credential, independently of OAuth tokens.
+fn key_ok(headers: &HeaderMap, key: Option<&str>) -> bool {
+    let Some(key) = key else { return true };
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -254,8 +239,8 @@ fn key_ok(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-async fn image_models_handler(headers: HeaderMap) -> Response {
-    if !key_ok(&headers) {
+async fn image_models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !key_ok(&headers, state.api_key.as_deref()) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"invalid_api_key","message":"Missing or wrong relay key"}}))).into_response();
     }
     Json(serde_json::json!({"object":"list","data":[{"id":core::images::DEFAULT_IMAGE_MODEL,"object":"model","owned_by":"chatgpt","modalities":["image"],"operations":["generate","edit"]}],"source":"codex_builtin","entitlement_verified":false})).into_response()
@@ -283,7 +268,7 @@ async fn image_handler(
     payload: Result<Json<core::images::ImageRequest>, JsonRejection>,
     edit: bool,
 ) -> Response {
-    if !key_ok(&headers) {
+    if !key_ok(&headers, state.api_key.as_deref()) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"invalid_api_key","message":"Missing or wrong relay key"}}))).into_response();
     }
     let request = match payload {
@@ -320,13 +305,13 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, StatusCode> {
-    if !key_ok(&headers) {
-        warn!("chat/completions без ключа петли (RELAY_API_KEY задан) — отказ");
+    if !key_ok(&headers, state.api_key.as_deref()) {
+        warn!("chat/completions without the relay client key was refused");
         return Ok((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": {
-                    "message": "missing or wrong Authorization: Bearer <RELAY_API_KEY>",
+                    "message": "missing or wrong relay client API key",
                     "type": "invalid_request_error",
                     "param": null,
                     "code": "invalid_api_key"
@@ -557,6 +542,7 @@ mod tests {
         write_test_account(root.path(), "secondary", "acct-secondary");
         let accounts = AccountRouter::load(root.path()).await.unwrap();
         let app = app_router(AppState {
+            api_key: None,
             config: Arc::new(Config {
                 codex_home: root.path().into(),
                 chatgpt_base_url: format!("http://{address}"),
@@ -585,9 +571,6 @@ mod tests {
                 .uri(uri)
                 .header("content-type", "application/json")
                 .header("x-codex-image-turn-id", "turn-fixture");
-            if let Some(key) = loop_key() {
-                builder = builder.header("authorization", format!("Bearer {key}"));
-            }
             let response = app
                 .clone()
                 .oneshot(builder.body(Body::from(payload.to_string())).unwrap())
@@ -654,6 +637,7 @@ mod tests {
         chat_completions::set_test_upstream_url(Some(upstream_url));
         let accounts = AccountRouter::load(root).await.unwrap();
         let app = app_router(AppState {
+            api_key: None,
             config: Arc::new(Config {
                 codex_home: root.to_path_buf(),
                 chatgpt_base_url: String::new(),
@@ -854,6 +838,7 @@ mod tests {
         let root = tempdir().unwrap();
         write_test_account(root.path(), "primary", "acct-primary");
         let app = app_router(AppState {
+            api_key: None,
             config: Arc::new(Config {
                 codex_home: root.path().to_path_buf(),
                 chatgpt_base_url: String::new(),

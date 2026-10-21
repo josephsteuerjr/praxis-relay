@@ -81,6 +81,7 @@ impl Relay {
             .write(true)
             .open(config.codex_home.join("runtime.lock"))?;
         lock.try_lock().context("This relay installation is already open; use its window or the headless control commands")?;
+        let api_key = crate::local_key::load(&config.codex_home, std::env::var("RELAY_API_KEY").ok().as_deref())?;
         let settings: Value = fs::read(config.codex_home.join("settings.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -103,6 +104,7 @@ impl Relay {
         chat_completions::resolve_codex_cli_version(&client).await;
         Ok(Arc::new(Self {
             state: AppState {
+                api_key: Some(Arc::from(api_key)),
                 config,
                 accounts,
                 client,
@@ -225,7 +227,7 @@ impl Relay {
         Ok(
             json!({"product":"Praxis Relay","version":env!("CARGO_PKG_VERSION"),"running":running,
             "port":port,"base_url":format!("http://127.0.0.1:{port}/v1"),
-            "api_key":crate::loop_key(),"auth_directory":self.state.config.codex_home,
+            "api_key":self.state.api_key.as_deref(),"auth_directory":self.state.config.codex_home,
             "protocol_version":chat_completions::codex_cli_version(),"accounts":accounts,
             "login":login,"login_url":if login.pending { crate::login::lib::login_url() } else { None },
             "events":self.events.lock().await.clone()}),
@@ -380,6 +382,7 @@ mod tests {
         let lock = fs::File::create(root.join("lock")).unwrap();
         Arc::new(Relay {
             state: AppState {
+                api_key: Some(Arc::from("test-relay-client-key")),
                 config,
                 accounts: AccountRouter::open(root).await.unwrap(),
                 client: reqwest::Client::new(),
@@ -393,6 +396,27 @@ mod tests {
             port: Mutex::new(port),
             _lock: lock,
         })
+    }
+
+    #[tokio::test]
+    async fn model_and_image_requests_require_the_installation_key() {
+        let root = tempfile::tempdir().unwrap();
+        let relay = isolated(root.path(), 0).await;
+        relay.start().await.unwrap();
+        let address: ControlAddress = serde_json::from_slice(&fs::read(descriptor(root.path())).unwrap()).unwrap();
+        let base = format!("http://127.0.0.1:{}", address.port);
+        let client = reqwest::Client::new();
+        for route in ["/v1/chat/completions", "/v1/images/generations", "/v1/images/edits"] {
+            for key in [None, Some("relay"), Some("wrong-key")] {
+                let mut request = client.post(format!("{base}{route}")).json(&json!({}));
+                if let Some(key) = key { request = request.bearer_auth(key); }
+                assert_eq!(request.send().await.unwrap().status(), 401, "{route}");
+            }
+        }
+        let image_catalog = format!("{base}/v1/images/models");
+        assert_eq!(client.get(&image_catalog).send().await.unwrap().status(), 401);
+        assert_eq!(client.get(&image_catalog).bearer_auth("test-relay-client-key").send().await.unwrap().status(), 200);
+        relay.stop().await.unwrap();
     }
 
     #[tokio::test]

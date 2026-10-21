@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn state(root: &std::path::Path, accounts: AccountRouter) -> AppState {
     AppState {
+        api_key: None,
         config: Arc::new(Config {
             codex_home: root.to_path_buf(),
             chatgpt_base_url: String::new(),

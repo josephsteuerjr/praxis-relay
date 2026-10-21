@@ -51,9 +51,10 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
         try:
             wait_for(lambda:(auth/"control.json").is_file())
             address=json.loads((auth/"control.json").read_text())
-            def request(path,body=None,key=True,origin=None):
+            def request(path,body=None,key=True,origin=None,api_key=None):
                 headers={}
                 if key:headers["x-relay-control"]=address["token"]
+                if api_key:headers["Authorization"]="Bearer "+api_key
                 if origin:headers["Origin"]=origin
                 if body is not None:headers["Content-Type"]="application/json"
                 req=urllib.request.Request(f"http://127.0.0.1:{port}"+path,
@@ -66,6 +67,11 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
                 assert status==200,(op,value)
                 return value
             check(command("status")["running"],"starts without credentials")
+            client_key=command("status")["api_key"]
+            check(isinstance(client_key,str) and len(client_key)==47 and client_key.startswith("sk-") and client_key[3:].isalnum(),"client key matches the required 47-character sk- format")
+            check(request("/v1/images/models",api_key=client_key)[0]==200,"generated client key is accepted")
+            check(request("/v1/images/models",key=False)[0]==401,"missing client key is rejected")
+            check(request("/v1/images/models",api_key="relay")[0]==401,"old relay placeholder is rejected")
             check(request("/_relay/control",dict(op="logout",slot="all"),key=False)[0]==403,"anonymous controls are rejected")
             check(request("/_relay/control",dict(op="logout",slot="all"),origin="https://invalid.example")[0]==403,"browser origins are rejected")
             def write_account(slot):
@@ -102,6 +108,7 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
                 checks.append("OAuth port occupied: interpreter smoke explicitly skipped")
             command("logout","all")
             check(not any(a["configured"] for a in command("status")["accounts"]),"logout all removes both slots")
+            check(command("status")["api_key"]==client_key,"account logout preserves the client key")
             check(request("/health")[0]==200,"management stays alive after last logout")
             completed=subprocess.run([str(binary),"status"],env=env,capture_output=True,text=True,timeout=15)
             check(completed.returncode==0 and json.loads(completed.stdout)["running"],"a second CLI controls the live process")
@@ -109,6 +116,12 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             check(completed.returncode==0,"headless stop command succeeds")
             check(process.wait(timeout=10)==0,"headless service exits cleanly")
             check(not (auth/"control.json").exists(),"stop removes its control capability")
+            process=subprocess.Popen([str(binary),"serve","--headless"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
+            wait_for(lambda:(auth/"control.json").is_file())
+            address=json.loads((auth/"control.json").read_text())
+            check(command("status")["api_key"]==client_key,"client key survives an actual process restart")
+            command("stop")
+            check(process.wait(timeout=10)==0,"restarted service exits cleanly")
         finally:
             if process.poll() is None:
                 try:command("cancel_login")

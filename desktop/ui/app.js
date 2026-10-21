@@ -53,7 +53,7 @@ function render(next){
   $("sidebar-version").textContent=`Praxis Relay ${state.version}`;
   $("server-badge").textContent=state.running?"● API работает":"● API остановлен";$("server-badge").classList.toggle("online",state.running);
   $("server-toggle").textContent=state.running?"Остановить API":"Запустить API";
-  $("base-url").textContent=state.base_url;$("api-key").textContent=state.api_key||"relay";
+  $("base-url").textContent=state.base_url;$("api-key").textContent=state.api_key||"—";
   $("connection-state").textContent=state.running?(state.accounts.some(a=>a.configured)?"Готов принимать запросы":"Подключи аккаунт для запросов"):"Запусти API для подключения";
   $("auth-dir").textContent=state.auth_directory;$("app-version").textContent=state.version;$("protocol-version").textContent=state.protocol_version;
   if(document.activeElement!==$("port"))$("port").value=state.port;$("port").disabled=state.running;$("save-port").disabled=state.running;

@@ -79,9 +79,14 @@ upstream session or sign out another application.
 
 ## Client connection and API
 
-Default base URL: `http://127.0.0.1:5011/v1`. Use `relay` as the client API key
-unless `RELAY_API_KEY` is configured. That optional local Bearer credential is
-separate from subscription tokens. The listener always binds to loopback.
+Default base URL: `http://127.0.0.1:5011/v1`. Copy the client API key from the
+desktop connection card or headless `status`. A new installation generates a
+47-character key starting with `sk-` and stores it in `local_auth/api-key.txt`.
+The same key survives restarts, account changes and switching between desktop
+and headless. Missing or incorrect client keys are refused for generation.
+`RELAY_API_KEY` explicitly overrides it for embedding hosts without modifying
+the saved default. This local credential is separate from subscription tokens.
+The listener always binds to loopback; do not share the key or data directory.
 
 - `POST /v1/chat/completions` (also `/chat/completions`): final JSON with `stream`
   false/absent, SSE with true; tool calls and vision. Omitted tool `strict` stays
