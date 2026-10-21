@@ -59,6 +59,7 @@ pub fn is_fallback_model(model: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
+    #[serde(default)]
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)]

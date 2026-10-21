@@ -1,11 +1,15 @@
 [package]
-name = "codex-proxy-server"
-version = "0.8.6"
+name = "praxis-relay"
+version = "1.0.0"
 edition = "2021"
 authors = ["Yegor Kosyrev <y.kosyrev@mailfence.com>"]
 license = "MIT"
 repository = "https://github.com/josephsteuerjr/praxis-relay"
 description = "Turn a ChatGPT subscription into a local OpenAI-compatible API"
+
+[[bin]]
+name = "praxis-relay-headless"
+path = "src/main.rs"
 
 [dependencies]
 # Web server
@@ -53,12 +57,9 @@ once_cell = "1.21.3"
 [dev-dependencies]
 pretty_assertions = "1"
 
-[target.'cfg(windows)'.dependencies]
-# System-tray presence for the running server (tray.rs)
-tray-icon = "0.19"
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_Console",
-    "Win32_UI_HiDpi",
-    "Win32_UI_WindowsAndMessaging",
-] }
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = "debuginfo"

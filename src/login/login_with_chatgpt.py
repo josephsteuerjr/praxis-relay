@@ -29,6 +29,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -144,6 +145,9 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/success":
+            if self.server.exit_code != 0:
+                self.send_error(400, "Login has not completed")
+                return
             # Serve confirmation page then gracefully shut down the server so
             # the main thread can exit with the previously captured exit code.
             self._send_html(LOGIN_SUCCESS_HTML)
@@ -205,7 +209,8 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             eprint(f"Failed to flush response: {e}")
 
-        self.request_shutdown()
+        if code >= 500:
+            self.request_shutdown()
 
     def _send_redirect(self, url: str) -> None:
         self.send_response(302)
@@ -225,94 +230,8 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):  # type: ignore[attr-defined]
             super().log_message(fmt, *args)
 
-    def _obtain_api_key(
-        self,
-        token_claims: Dict[str, Any],
-        access_claims: Dict[str, Any],
-        token_data: TokenData,
-    ) -> tuple[str | None, str | None]:
-        """Obtain an API key from the auth service.
-
-        Returns (api_key, success_url) if successful, None otherwise.
-        """
-
-        org_id = token_claims.get("organization_id")
-        project_id = token_claims.get("project_id")
-
-        if not org_id or not project_id:
-            return (None, None)
-
-        random_id = secrets.token_hex(6)
-
-        # 2. Token exchange to obtain API key
-        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        exchange_data = urllib.parse.urlencode(
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "client_id": self.server.client_id,
-                "requested_token": "openai-api-key",
-                "subject_token": token_data.id_token,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                "name": f"Codex CLI [auto-generated] ({today}) [{random_id}]",
-            }
-        ).encode()
-
-        exchanged_access_token: str
-        with urllib.request.urlopen(
-            urllib.request.Request(
-                self.server.token_endpoint,
-                data=exchange_data,
-                method="POST",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            ),
-            context=CA_CONTEXT,
-        ) as resp:
-            exchange_payload = json.loads(resp.read().decode())
-            exchanged_access_token = exchange_payload["access_token"]
-
-        # Determine whether the organization still requires additional
-        # setup (e.g., adding a payment method) based on the ID-token
-        # claim provided by the auth service.
-        completed_onboarding = token_claims.get("completed_platform_onboarding") == True
-        chatgpt_plan_type = access_claims.get("chatgpt_plan_type")
-        is_org_owner = token_claims.get("is_org_owner") == True
-        needs_setup = not completed_onboarding and is_org_owner
-
-        # Build the success URL on the same host/port as the callback and
-        # include the required query parameters for the front-end page.
-        success_url_query = {
-            "id_token": token_data.id_token,
-            "needs_setup": "true" if needs_setup else "false",
-            "org_id": org_id,
-            "project_id": project_id,
-            "plan_type": chatgpt_plan_type,
-            "platform_url": (
-                "https://platform.openai.com"
-                if self.server.issuer == "https://auth.openai.com"
-                else "https://platform.api.openai.org"
-            ),
-        }
-        success_url = f"{URL_BASE}/success?{urllib.parse.urlencode(success_url_query)}"
-
-        # Attempt to redeem complimentary API credits for eligible ChatGPT
-        # Plus / Pro subscribers. Any errors are logged but do not interrupt
-        # the login flow.
-
-        try:
-            maybe_redeem_credits(
-                issuer=self.server.issuer,
-                client_id=self.server.client_id,
-                id_token=token_data.id_token,
-                refresh_token=token_data.refresh_token,
-                codex_home=self.server.codex_home,
-            )
-        except Exception as exc:  # pragma: no cover – best-effort only
-            eprint(f"Unable to redeem ChatGPT subscriber API credits: {exc}")
-
-        return (exchanged_access_token, success_url)
-
     def _exchange_code(self, code: str) -> tuple[AuthBundle, str]:
-        """Perform token + token-exchange to obtain an OpenAI API key.
+        """Exchange the authorization code for subscription tokens.
 
         Returns (AuthBundle, success_url).
         """
@@ -337,7 +256,7 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             ),
-            context=CA_CONTEXT,
+            context=CA_CONTEXT, timeout=30,
         ) as resp:
             payload = json.loads(resp.read().decode())
 
@@ -356,18 +275,13 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
                 account_id=chatgpt_account_id,
             )
 
-        access_token_parts = token_data.access_token.split(".")
-        if len(access_token_parts) != 3:
-            raise ValueError("Invalid access token")
-
-        access_token_claims = _decode_jwt_segment(access_token_parts[1])
-
-        token_claims = id_token_claims.get("https://api.openai.com/auth", {})
-        access_claims = access_token_claims.get("https://api.openai.com/auth", {})
-
-        exchanged_access_token, success_url = self._obtain_api_key(
-            token_claims, access_claims, token_data
-        )
+        # Subscription sign-in never creates a Platform API key or redeems
+        # billing credits. A successful callback also never puts tokens in a URL.
+        access_claims = (parse_id_token_claims(token_data.access_token) or {}).get(
+            "https://api.openai.com/auth", {})
+        token_data.account_id = token_data.account_id or access_claims.get("chatgpt_account_id", "")
+        if not token_data.account_id or not token_data.access_token or not token_data.refresh_token:
+            raise ValueError("Incomplete ChatGPT subscription credentials")
 
         # Persist refresh_token/id_token for future use (redeem credits etc.)
         last_refresh_str = (
@@ -377,12 +291,12 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
         )
 
         auth_bundle = AuthBundle(
-            api_key=exchanged_access_token,
+            api_key=None,
             token_data=token_data,
             last_refresh=last_refresh_str,
         )
 
-        return (auth_bundle, success_url or f"{URL_BASE}/success")
+        return (auth_bundle, f"{URL_BASE}/success")
 
     def request_shutdown(self) -> None:
         # shutdown() must be invoked from another thread to avoid
@@ -415,13 +329,24 @@ def _write_auth_file(*, auth: AuthBundle, codex_home: str) -> bool:
         },
         "last_refresh": auth.last_refresh,
     }
+    temporary = None
     try:
-        with open(auth_path, "w", encoding="utf-8") as fp:
-            if hasattr(os, "fchmod"):  # POSIX-safe
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=codex_home,
+                                         prefix=".auth-", delete=False) as fp:
+            temporary = fp.name
+            if hasattr(os, "fchmod"):
                 os.fchmod(fp.fileno(), 0o600)
             json.dump(auth_json_contents, fp, indent=2)
-    except Exception as exc:  # pragma: no cover – permissions/filesystem
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary, auth_path)
+    except Exception as exc:
         eprint(f"ERROR: unable to write auth file: {exc}")
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
         return False
 
     return True
@@ -454,7 +379,7 @@ class _ApiKeyHTTPServer(http.server.HTTPServer):
         self.issuer: str = DEFAULT_ISSUER
         self.token_endpoint: str = f"{self.issuer}/oauth/token"
         self.client_id: str = client_id
-        port = server_address[1]
+        port = self.server_port
         self.redirect_uri: str = f"http://localhost:{port}/auth/callback"
         self.pkce: PkceCodes = _generate_pkce()
         self.state: str = secrets.token_hex(32)
@@ -473,163 +398,6 @@ class _ApiKeyHTTPServer(http.server.HTTPServer):
             "state": self.state,
         }
         return f"{self.issuer}/oauth/authorize?" + urllib.parse.urlencode(params)
-
-
-def maybe_redeem_credits(
-    *,
-    issuer: str,
-    client_id: str,
-    id_token: str | None,
-    refresh_token: str,
-    codex_home: str,
-) -> None:
-    """Attempt to redeem complimentary API credits for ChatGPT subscribers.
-
-    The operation is best-effort: any error results in a warning being printed
-    and the function returning early without raising.
-    """
-    id_claims: Dict[str, Any] | None = parse_id_token_claims(id_token or "")
-
-    # Refresh expired ID token, if possible
-    token_expired = True
-    if id_claims and isinstance(id_claims.get("exp"), int):
-        token_expired = _current_timestamp_ms() >= int(id_claims["exp"]) * 1000
-
-    if token_expired:
-        eprint("Refreshing credentials...")
-        new_refresh_token: str | None = None
-        new_id_token: str | None = None
-
-        try:
-            payload = json.dumps(
-                {
-                    "client_id": client_id,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "scope": "openid profile email",
-                }
-            ).encode()
-
-            req = urllib.request.Request(
-                url="https://auth.openai.com/oauth/token",
-                data=payload,
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-
-            with urllib.request.urlopen(req, context=CA_CONTEXT) as resp:
-                refresh_data = json.loads(resp.read().decode())
-                new_id_token = refresh_data.get("id_token")
-                new_id_claims = parse_id_token_claims(new_id_token or "")
-                new_refresh_token = refresh_data.get("refresh_token")
-        except Exception as err:
-            eprint("Unable to refresh ID token via token-exchange:", err)
-            return
-
-        if not new_id_token or not new_refresh_token:
-            return
-
-        # Update auth.json with new tokens.
-        try:
-            auth_dir = codex_home
-            auth_path = os.path.join(auth_dir, "auth.json")
-            with open(auth_path, "r", encoding="utf-8") as fp:
-                existing = json.load(fp)
-
-            tokens = existing.setdefault("tokens", {})
-            tokens["id_token"] = new_id_token
-            # Note this does not touch the access_token?
-            tokens["refresh_token"] = new_refresh_token
-            tokens["last_refresh"] = (
-                datetime.datetime.now(datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-            with open(auth_path, "w", encoding="utf-8") as fp:
-                if hasattr(os, "fchmod"):
-                    os.fchmod(fp.fileno(), 0o600)
-                json.dump(existing, fp, indent=2)
-        except Exception as err:
-            eprint("Unable to update refresh token in auth file:", err)
-
-        if not new_id_claims:
-            # Still couldn't parse claims.
-            return
-
-        id_token = new_id_token
-        id_claims = new_id_claims
-
-    # Done refreshing credentials: now try to redeem credits.
-    if not id_token:
-        eprint("No ID token available, cannot redeem credits.")
-        return
-
-    auth_claims = id_claims.get("https://api.openai.com/auth", {})
-
-    # Subscription eligibility check (Plus or Pro, >7 days active)
-    sub_start_str = auth_claims.get("chatgpt_subscription_active_start")
-    if isinstance(sub_start_str, str):
-        try:
-            sub_start_ts = datetime.datetime.fromisoformat(sub_start_str.rstrip("Z"))
-            if datetime.datetime.now(
-                datetime.timezone.utc
-            ) - sub_start_ts < datetime.timedelta(days=7):
-                eprint(
-                    "Sorry, your subscription must be active for more than 7 days to redeem credits."
-                )
-                return
-        except ValueError:
-            # Malformed; ignore
-            pass
-
-    completed_onboarding = bool(auth_claims.get("completed_platform_onboarding"))
-    is_org_owner = bool(auth_claims.get("is_org_owner"))
-    needs_setup = not completed_onboarding and is_org_owner
-    plan_type = auth_claims.get("chatgpt_plan_type")
-
-    if needs_setup or plan_type not in {"plus", "pro"}:
-        eprint("Only users with Plus or Pro subscriptions can redeem free API credits.")
-        return
-
-    api_host = (
-        "https://api.openai.com"
-        if issuer == "https://auth.openai.com"
-        else "https://api.openai.org"
-    )
-
-    try:
-        redeem_payload = json.dumps({"id_token": id_token}).encode()
-        req = urllib.request.Request(
-            url=f"{api_host}/v1/billing/redeem_credits",
-            data=redeem_payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-
-        with urllib.request.urlopen(req, context=CA_CONTEXT) as resp:
-            redeem_data = json.loads(resp.read().decode())
-
-        granted = redeem_data.get("granted_chatgpt_subscriber_api_credits", 0)
-        if granted and granted > 0:
-            eprint(
-                f"""Thanks for being a ChatGPT {"Plus" if plan_type == "plus" else "Pro"} subscriber!
-If you haven't already redeemed, you should receive {"$5" if plan_type == "plus" else "$50"} in API credits.
-
-Credits: https://platform.openai.com/settings/organization/billing/credit-grants
-More info: https://help.openai.com/en/articles/11381614""",
-            )
-        else:
-            eprint(
-                f"""It looks like no credits were granted:
-
-{json.dumps(redeem_data, indent=2)}
-
-Credits: https://platform.openai.com/settings/organization/billing/credit-grants
-More info: https://help.openai.com/en/articles/11381614"""
-            )
-    except Exception as err:
-        eprint("Credit redemption request failed:", err)
 
 
 def _generate_pkce() -> PkceCodes:
@@ -683,208 +451,10 @@ def _current_timestamp_ms() -> int:
     return int(time.time() * 1000)
 
 
-LOGIN_SUCCESS_HTML = """<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Sign into Codex CLI</title>
-    <link rel="icon" href='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="none" viewBox="0 0 32 32"%3E%3Cpath stroke="%23000" stroke-linecap="round" stroke-width="2.484" d="M22.356 19.797H17.17M9.662 12.29l1.979 3.576a.511.511 0 0 1-.005.504l-1.974 3.409M30.758 16c0 8.15-6.607 14.758-14.758 14.758-8.15 0-14.758-6.607-14.758-14.758C1.242 7.85 7.85 1.242 16 1.242c8.15 0 14.758 6.608 14.758 14.758Z"/%3E%3C/svg%3E' type="image/svg+xml">
-    <style>
-      .container {
-        margin: auto;
-        height: 100%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        position: relative;
-        background: white;
+LOGIN_SUCCESS_HTML = """<!doctype html><html lang="en"><meta charset="utf-8">
+<title>Praxis Relay - signed in</title><style>body{font:17px system-ui;background:#f4f2fa;color:#43385a;display:grid;place-items:center;min-height:90vh}main{background:white;padding:48px;border-radius:18px}h1{font-size:26px}p{color:#8a8098}</style>
+<main><h1>You're signed in to Praxis Relay.</h1><p>You can close this tab and return to the app.</p></main></html>"""
 
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-      }
-      .inner-container {
-        width: 400px;
-        flex-direction: column;
-        justify-content: flex-start;
-        align-items: center;
-        gap: 20px;
-        display: inline-flex;
-      }
-      .content {
-        align-self: stretch;
-        flex-direction: column;
-        justify-content: flex-start;
-        align-items: center;
-        gap: 20px;
-        display: flex;
-        margin-top: 15vh;
-      }
-      .svg-wrapper {
-        position: relative;
-      }
-      .title {
-        text-align: center;
-        color: var(--text-primary, #0D0D0D);
-        font-size: 32px;
-        font-weight: 400;
-        line-height: 40px;
-        word-wrap: break-word;
-      }
-      .setup-box {
-        width: 600px;
-        padding: 16px 20px;
-        background: var(--bg-primary, white);
-        box-shadow: 0px 4px 16px rgba(0, 0, 0, 0.05);
-        border-radius: 16px;
-        outline: 1px var(--border-default, rgba(13, 13, 13, 0.10)) solid;
-        outline-offset: -1px;
-        justify-content: flex-start;
-        align-items: center;
-        gap: 16px;
-        display: inline-flex;
-      }
-      .setup-content {
-        flex: 1 1 0;
-        justify-content: flex-start;
-        align-items: center;
-        gap: 24px;
-        display: flex;
-      }
-      .setup-text {
-        flex: 1 1 0;
-        flex-direction: column;
-        justify-content: flex-start;
-        align-items: flex-start;
-        gap: 4px;
-        display: inline-flex;
-      }
-      .setup-title {
-        align-self: stretch;
-        color: var(--text-primary, #0D0D0D);
-        font-size: 14px;
-        font-weight: 510;
-        line-height: 20px;
-        word-wrap: break-word;
-      }
-      .setup-description {
-        align-self: stretch;
-        color: var(--text-secondary, #5D5D5D);
-        font-size: 14px;
-        font-weight: 400;
-        line-height: 20px;
-        word-wrap: break-word;
-      }
-      .redirect-box {
-        justify-content: flex-start;
-        align-items: center;
-        gap: 8px;
-        display: flex;
-      }
-      .close-button,
-      .redirect-button {
-        height: 28px;
-        padding: 8px 16px;
-        background: var(--interactive-bg-primary-default, #0D0D0D);
-        border-radius: 999px;
-        justify-content: center;
-        align-items: center;
-        gap: 4px;
-        display: flex;
-      }
-      .close-button,
-      .redirect-text {
-        color: var(--interactive-label-primary-default, white);
-        font-size: 14px;
-        font-weight: 510;
-        line-height: 20px;
-        word-wrap: break-word;
-        text-decoration: none;
-      }
-      .logo {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 4rem;
-        height: 4rem;
-        border-radius: 16px;
-        border: .5px solid rgba(0, 0, 0, 0.1);
-        box-shadow: rgba(0, 0, 0, 0.1) 0px 4px 16px 0px;
-        box-sizing: border-box;
-        background-color: rgb(255, 255, 255);
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <div class="inner-container">
-        <div class="content">
-          <div class="logo">
-            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="none" viewBox="0 0 32 32"><path stroke="#000" stroke-linecap="round" stroke-width="2.484" d="M22.356 19.797H17.17M9.662 12.29l1.979 3.576a.511.511 0 0 1-.005.504l-1.974 3.409M30.758 16c0 8.15-6.607 14.758-14.758 14.758-8.15 0-14.758-6.607-14.758-14.758C1.242 7.85 7.85 1.242 16 1.242c8.15 0 14.758 6.608 14.758 14.758Z"></path></svg>
-          </div>
-          <div class="title">Signed in to Codex CLI</div>
-        </div>
-        <div class="close-box" style="display: none;">
-          <div class="setup-description">You may now close this page</div>
-        </div>
-        <div class="setup-box" style="display: none;">
-          <div class="setup-content">
-            <div class="setup-text">
-              <div class="setup-title">Finish setting up your API organization</div>
-              <div class="setup-description">Add a payment method to use your organization.</div>
-            </div>
-            <div class="redirect-box">
-              <div data-hasendicon="false" data-hasstarticon="false" data-ishovered="false" data-isinactive="false" data-ispressed="false" data-size="large" data-type="primary" class="redirect-button">
-                <div class="redirect-text">Redirecting in 3s...</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <script>
-      (function () {
-        const params = new URLSearchParams(window.location.search);
-        const needsSetup = params.get('needs_setup') === 'true';
-        const platformUrl = params.get('platform_url') || 'https://platform.openai.com';
-        const orgId = params.get('org_id');
-        const projectId = params.get('project_id');
-        const planType = params.get('plan_type');
-        const idToken = params.get('id_token');
-        // Show different message and optional redirect when setup is required
-        if (needsSetup) {
-          const setupBox = document.querySelector('.setup-box');
-          setupBox.style.display = 'flex';
-          const redirectUrlObj = new URL('/org-setup', platformUrl);
-          redirectUrlObj.searchParams.set('p', planType);
-          redirectUrlObj.searchParams.set('t', idToken);
-          redirectUrlObj.searchParams.set('with_org', orgId);
-          redirectUrlObj.searchParams.set('project_id', projectId);
-          const redirectUrl = redirectUrlObj.toString();
-          const message = document.querySelector('.redirect-text');
-          let countdown = 3;
-          function tick() {
-            message.textContent =
-              'Redirecting in ' + countdown + 's…';
-            if (countdown === 0) {
-              window.location.replace(redirectUrl);
-            } else {
-              countdown -= 1;
-              setTimeout(tick, 1000);
-            }
-          }
-          tick();
-        } else {
-          const closeBox = document.querySelector('.close-box');
-          closeBox.style.display = 'flex';
-        }
-      })();
-    </script>
-  </body>
-</html>"""
 
-# Unconditionally call `main()` instead of gating it behind
-# `if __name__ == "__main"` because this script is either:
-#
-# - invoked as a string passed to `python3 -c`
-# - run via `python3 login_with_chatgpt.py` for testing as part of local
-#   development
-main()
+if __name__ == "__main__":
+    main()

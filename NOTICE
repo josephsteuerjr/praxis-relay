@@ -23,3 +23,8 @@ The following files are derived from that project and have been modified:
   src/core/openai_tools.rs         declared in any module tree)
 
 This project is not affiliated with, endorsed by, or sponsored by OpenAI.
+
+The desktop embeds Golos Text (Copyright 2019 The Golos Text Project Authors)
+and Zen Kurenaido (Copyright 2021 The Zen Kurenaido Project Authors), licensed
+under SIL Open Font License 1.1. Full notices and licenses are embedded in
+desktop/ui/fonts/ and accessible from the application's Data settings.

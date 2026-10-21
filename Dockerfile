@@ -7,12 +7,10 @@ ENV CARGO_BUILD_JOBS=4
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates cmake perl build-essential \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /usr/src/codex
+WORKDIR /usr/src/relay
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && printf 'fn main(){}\n' > src/main.rs \
-    && cargo build --release || true
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release --locked --bin praxis-relay-headless
 
 FROM builder AS gate
 RUN cargo test --no-run --locked
@@ -20,13 +18,13 @@ RUN rustup component add clippy
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 ca-certificates curl \
+    libssl3 ca-certificates curl python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Rename on copy -> process name is neutral.
-COPY --from=builder /usr/src/codex/target/release/codex-proxy-server /usr/local/bin/relay
-ENV HOME=/root RUST_LOG=info RELAY_LOG_DIR=/app/logs
+COPY --from=builder /usr/src/relay/target/release/praxis-relay-headless /usr/local/bin/relay
+ENV HOME=/root RUST_LOG=info RELAY_AUTH_DIR=/app/local_auth
 EXPOSE 5011
 # Since 0.8.1 the binary takes its action from argv, so the old `echo 1 | relay`
 # workaround for the interactive menu is gone: `relay serve` starts the server.
-CMD ["relay", "serve"]
+CMD ["relay", "serve", "--headless"]
