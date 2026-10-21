@@ -54,7 +54,12 @@ aside{
   font-size:10px;
   font-weight:400;
   color:#9198ad;
-  margin-top:7px
+  margin-top:7px;
+  white-space:normal;
+  line-height:1.5
+}
+.brand>div{
+  min-width:0
 }
 .mark{
   font-size:36px;
