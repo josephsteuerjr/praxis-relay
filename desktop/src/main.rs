@@ -11,16 +11,50 @@ use tauri::{
 
 #[tauri::command]
 async fn relay_command(
+    window: tauri::WebviewWindow,
     relay: tauri::State<'_, Arc<Relay>>,
     op: String,
     slot: Option<String>,
     port: Option<u16>,
+    settings: Option<Value>,
 ) -> Result<Value, String> {
-    relay
+    if op == "configure" {
+        return relay
+            .configure(settings.unwrap_or(Value::Null))
+            .await
+            .map_err(|e| format!("{e:#}"));
+    }
+    let mut value = relay
         .inner()
         .command(&op, slot.as_deref(), port)
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?;
+    if value.get("product").is_some() {
+        value["window_visible"] = Value::Bool(window.is_visible().unwrap_or(false));
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn window_command(window: tauri::WebviewWindow, action: String) -> Result<bool, String> {
+    let result = match action.as_str() {
+        "drag" => window.start_dragging(),
+        "minimize" | "close" => window.set_skip_taskbar(true).and_then(|_| window.hide()),
+        "maximize" => window.is_maximized().and_then(|maximized| {
+            if maximized {
+                window.unmaximize()
+            } else {
+                window.maximize()
+            }
+        }),
+        "quit" => {
+            window.app_handle().exit(0);
+            Ok(())
+        }
+        _ => return Err("Unknown window action".into()),
+    };
+    result.map_err(|e| e.to_string())?;
+    Ok(window.is_maximized().unwrap_or(false))
 }
 
 fn show(app: &tauri::AppHandle) {
@@ -39,7 +73,8 @@ fn main() {
             let relay = tauri::async_runtime::block_on(Relay::new())?;
             // Open the management window even before login or when the API port
             // is occupied. An actionable startup error remains visible in the UI.
-            app.manage(relay);
+            let preferences = tauri::async_runtime::block_on(relay.preferences());
+            app.manage(relay.clone());
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(monitor) = window.current_monitor()? {
                     let area = monitor.work_area();
@@ -69,14 +104,14 @@ fn main() {
                     let i = (y * 32 + x) * 4;
                     let inside = (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 210;
                     rgba[i..i + 4].copy_from_slice(if inside {
-                        &[114, 96, 236, 255]
+                        &[224, 145, 90, 255]
                     } else {
                         &[0, 0, 0, 0]
                     });
                     if (x > 12 && x < 19 && y > 6 && y < 26)
                         || (y > 12 && y < 19 && x > 6 && x < 26)
                     {
-                        rgba[i..i + 4].copy_from_slice(&[250, 248, 255, 255]);
+                        rgba[i..i + 4].copy_from_slice(&[29, 26, 23, 255]);
                     }
                 }
             }
@@ -105,6 +140,20 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            let startup_ok = if preferences.auto_start_api {
+                match tauri::async_runtime::block_on(relay.start()) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tauri::async_runtime::block_on(relay.startup_error(format!("{error:#}")));
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if !preferences.start_in_tray || !startup_ok {
+                show(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -121,7 +170,7 @@ fn main() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![relay_command])
+        .invoke_handler(tauri::generate_handler![relay_command, window_command])
         .build(tauri::generate_context!());
     let application = match application {
         Ok(application) => application,

@@ -15,9 +15,10 @@ mod chat_response;
 #[cfg(test)]
 mod chat_response_tests;
 mod core;
-mod login;
 mod local_key;
+mod login;
 pub mod service;
+pub mod settings;
 
 use core::account_router::AccountRouter;
 use core::catalog::ModelCatalog;
@@ -349,6 +350,19 @@ async fn chat_completions_handler(
     info!("Request tools count: {}", request.tools.len());
     info!("Request image parts count: {}", request.image_part_count());
 
+    if request.model.trim().is_empty() {
+        request.model = state.config.model.clone();
+        if request.model.is_empty() {
+            request.model = state
+                .catalog
+                .snapshot(&state.accounts, &state.client)
+                .await
+                .listed_slugs()
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+        }
+    }
     // Validate the model against the backend's live catalog (core::catalog), not
     // a constant and not a prefix: a slug the cached catalog does not know
     // triggers one early refresh, so a model released after the last fetch is

@@ -6,8 +6,8 @@
   "build": { "frontendDist": "ui" },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "label": "main", "title": "Praxis Relay", "width": 1120, "height": 760, "minWidth": 720, "minHeight": 560, "center": true }],
-    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'" }
+    "windows": [{ "label": "main", "title": "Praxis Relay", "width": 1120, "height": 760, "minWidth": 720, "minHeight": 560, "center": true, "decorations": false, "visible": false, "backgroundColor": "#f8eee0" }],
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'" }
   },
   "bundle": { "active": false, "icon": ["icons/icon.ico", "icons/icon.png"] }
 }

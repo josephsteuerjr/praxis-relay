@@ -68,6 +68,14 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
                 return value
             check(command("status")["running"],"starts without credentials")
             client_key=command("status")["api_key"]
+            patch=root/"patch.json"
+            patch.write_text(json.dumps({"appearance":{"theme":"dark","scale":115},"labels":{"primary":"Work"},"defaults":{"model":"configured-model","reasoning":"high"}}))
+            completed=subprocess.run([str(binary),"configure",str(patch)],env=env,capture_output=True,text=True,timeout=15)
+            configured=json.loads(completed.stdout)
+            check(completed.returncode==0 and configured["settings"]["appearance"]["theme"]=="dark" and configured["restart_required"],"CLI configures the running service and reports pending API changes")
+            saved=(auth/"settings.json").read_bytes()
+            code,_=request("/_relay/control",dict(op="configure",settings={"port":0}))
+            check(code==409 and (auth/"settings.json").read_bytes()==saved,"invalid settings preserve the previous document")
             check(isinstance(client_key,str) and len(client_key)==47 and client_key.startswith("sk-") and client_key[3:].isalnum(),"client key matches the required 47-character sk- format")
             check(request("/v1/images/models",api_key=client_key)[0]==200,"generated client key is accepted")
             check(request("/v1/images/models",key=False)[0]==401,"missing client key is rejected")
@@ -120,6 +128,8 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             wait_for(lambda:(auth/"control.json").is_file())
             address=json.loads((auth/"control.json").read_text())
             check(command("status")["api_key"]==client_key,"client key survives an actual process restart")
+            restarted=command("status")
+            check(restarted["settings"]["labels"]["primary"]=="Work" and restarted["settings"]["appearance"]["scale"]==115 and not restarted["restart_required"],"appearance, account names and model defaults survive process restart and apply to the new API")
             command("stop")
             check(process.wait(timeout=10)==0,"restarted service exits cleanly")
         finally:

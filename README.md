@@ -106,6 +106,41 @@ A listed model is not proof of account entitlement. Quota exhaustion may move
 new requests to a distinct configured account. Additional model quota buckets
 remain separate; switching accounts does not merge or transfer them.
 
+## Desktop preferences and headless configuration
+
+The frameless desktop uses its own window controls; close and minimize hide it
+in the tray. Ctrl+1/2/3 and Ctrl+, open sections; Ctrl+Q exits. Paper palettes,
+light/dark/system themes, six accents, text size, density, handwriting, grain
+and reduced motion apply immediately. The client key is masked until revealed.
+
+`local_auth/settings.json` also stores account labels, optional quota polling
+while the window is visible, start-in-tray and API-on-launch preferences, port,
+and request defaults (model, reasoning, parallel tools and instructions).
+Existing port-only settings migrate without changing credentials or the key.
+Changed API defaults are applied on the next API start; a running desktop
+shows a restart action. Appearance changes do not restart the server.
+Explicit environment variables take priority and their fields are marked read-only.
+
+The headless CLI uses the same validated settings, offline or through the
+authenticated controls of an already running process:
+
+```sh
+praxis-relay-headless configure patch.json
+```
+
+Example patch (unspecified fields are preserved):
+
+```json
+{"appearance":{"theme":"dark"},"labels":{"primary":"Work"},"defaults":{"reasoning":"high"}}
+```
+
+A missing/blank chat model uses the saved model, or the first listed catalog
+model when no default was chosen. Explicit request values retain priority.
+Additional instructions accompany either built-in instruction mode.
+An existing nonempty `instructions.txt` / `RELAY_INSTRUCTIONS_FILE` remains a
+complete per-request override; the desktop explains this and disables the
+superseded instruction fields. No provider entitlement is inferred from a setting.
+
 ## Build
 
 Rust 1.94+. The desktop also needs the Tauri platform prerequisites:

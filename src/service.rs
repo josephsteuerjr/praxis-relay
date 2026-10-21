@@ -7,6 +7,7 @@ use crate::core::{
     config::Config,
     limits::LimitsCache,
 };
+use crate::settings::Settings;
 use crate::{app_router, AppState};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -34,6 +35,7 @@ struct Running {
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
     address: ControlAddress,
+    config: Arc<Config>,
 }
 #[derive(Default, Clone, Serialize)]
 struct LoginState {
@@ -48,7 +50,7 @@ pub struct Relay {
     login_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     login_state: Arc<Mutex<LoginState>>,
     events: Arc<Mutex<VecDeque<Value>>>,
-    port: Mutex<u16>,
+    settings: Mutex<Settings>,
     _lock: fs::File,
 }
 
@@ -81,22 +83,12 @@ impl Relay {
             .write(true)
             .open(config.codex_home.join("runtime.lock"))?;
         lock.try_lock().context("This relay installation is already open; use its window or the headless control commands")?;
-        let api_key = crate::local_key::load(&config.codex_home, std::env::var("RELAY_API_KEY").ok().as_deref())?;
-        let settings: Value = fs::read(config.codex_home.join("settings.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(json!({}));
-        let port = if let Ok(raw) = std::env::var("RELAY_PORT") {
-            raw.parse::<u16>()
-                .ok()
-                .filter(|p| *p > 0)
-                .context("RELAY_PORT must be 1..65535")?
-        } else {
-            settings["port"]
-                .as_u64()
-                .filter(|p| *p > 0 && *p <= 65535)
-                .unwrap_or(5011) as u16
-        };
+        let api_key = crate::local_key::load(
+            &config.codex_home,
+            std::env::var("RELAY_API_KEY").ok().as_deref(),
+        )?;
+        let settings = Settings::load(&config.codex_home)?;
+        settings.effective_port()?;
         let accounts = AccountRouter::open(&config.codex_home).await?;
         let client = reqwest::Client::builder()
             .tcp_keepalive(std::time::Duration::from_secs(30))
@@ -115,7 +107,7 @@ impl Relay {
             login_task: Mutex::new(None),
             login_state: Arc::new(Mutex::new(LoginState::default())),
             events: Arc::new(Mutex::new(VecDeque::new())),
-            port: Mutex::new(port),
+            settings: Mutex::new(settings),
             _lock: lock,
         }))
     }
@@ -136,20 +128,23 @@ impl Relay {
                 return Ok(());
             }
             *running = None;
-            let port = *self.port.lock().await;
+            let settings = self.settings.lock().await.clone();
+            let port = settings.effective_port()?;
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,port)).await
             .with_context(|| format!("Port {port} is already in use or unavailable. Stop its owner or choose another port."))?;
             let port = listener.local_addr()?.port();
-            *self.port.lock().await = port;
             let address = ControlAddress {
                 port,
                 token: uuid::Uuid::new_v4().to_string(),
             };
             let control = Router::new()
                 .route("/_relay/control", post(control_handler))
-                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::extract::DefaultBodyLimit::max(32768))
                 .with_state((self.clone(), address.token.clone()));
-            let app = app_router(self.state.clone()).merge(control);
+            let config = Arc::new(settings.config(&self.state.config));
+            let mut state = self.state.clone();
+            state.config = config.clone();
+            let app = app_router(state).merge(control);
             private_json(&descriptor(&self.state.config.codex_home), &address)?;
             let (shutdown, receive) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
@@ -163,6 +158,7 @@ impl Relay {
                 shutdown,
                 task,
                 address,
+                config,
             });
             self.event(format!("API started on 127.0.0.1:{port}")).await;
             Ok(())
@@ -217,21 +213,59 @@ impl Relay {
                 "email":email,"plan":plan,"error":error}));
         }
         let login = self.login_state.lock().await.clone();
-        let running = self
-            .running
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|r| !r.task.is_finished());
-        let port = *self.port.lock().await;
+        let settings = self.settings.lock().await.clone();
+        let desired_port = settings.effective_port()?;
+        let desired_config = settings.config(&self.state.config);
+        let (running, port, restart_required) = {
+            let server = self.running.lock().await;
+            match server.as_ref().filter(|r| !r.task.is_finished()) {
+                Some(r) => (
+                    true,
+                    r.address.port,
+                    r.address.port != desired_port || *r.config != desired_config,
+                ),
+                None => (false, desired_port, false),
+            }
+        };
+        let overrides: Vec<&str> = [
+            "RELAY_PORT",
+            "RELAY_DEFAULT_MODEL",
+            "RELAY_REASONING_EFFORT",
+            "RELAY_INSTRUCTIONS",
+            "RELAY_PARALLEL_TOOL_CALLS",
+            "RELAY_API_KEY",
+        ]
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
         Ok(
             json!({"product":"Praxis Relay","version":env!("CARGO_PKG_VERSION"),"running":running,
             "port":port,"base_url":format!("http://127.0.0.1:{port}/v1"),
             "api_key":self.state.api_key.as_deref(),"auth_directory":self.state.config.codex_home,
             "protocol_version":chat_completions::codex_cli_version(),"accounts":accounts,
+            "settings":settings,"restart_required":restart_required,"environment_overrides":overrides,
+            "instructions_file":crate::core::config::custom_instructions().map(|_| crate::core::config::instructions_file_path()),
             "login":login,"login_url":if login.pending { crate::login::lib::login_url() } else { None },
             "events":self.events.lock().await.clone()}),
         )
+    }
+
+    pub async fn preferences(&self) -> Settings {
+        self.settings.lock().await.clone()
+    }
+
+    pub async fn configure(&self, patch: Value) -> Result<Value> {
+        {
+            let mut settings = self.settings.lock().await;
+            let next = settings.patched(patch)?;
+            private_json(&self.state.config.codex_home.join("settings.json"), &next)?;
+            *settings = next;
+        }
+        self.status().await
+    }
+
+    pub async fn startup_error(&self, error: String) {
+        self.event(format!("API startup failed: {error}")).await;
     }
 
     pub async fn begin_login(self: &Arc<Self>, slot: &str) -> Result<()> {
@@ -353,11 +387,17 @@ impl Relay {
                     bail!("Stop the API before changing its port");
                 }
                 let port = port.filter(|p| *p > 0).context("Port must be 1..65535")?;
-                private_json(
-                    &self.state.config.codex_home.join("settings.json"),
-                    &json!({"port":port}),
-                )?;
-                *self.port.lock().await = port;
+                return self.configure(json!({"port":port})).await;
+            }
+            "models" => {
+                let snapshot = self
+                    .state
+                    .catalog
+                    .snapshot(&self.state.accounts, &self.state.client)
+                    .await;
+                return Ok(
+                    json!({"source":snapshot.source.as_str(),"models":snapshot.listed_slugs()}),
+                );
             }
             _ => bail!("Unknown command: {op}"),
         }
@@ -393,9 +433,57 @@ mod tests {
             login_task: Mutex::new(None),
             login_state: Arc::new(Mutex::new(LoginState::default())),
             events: Arc::new(Mutex::new(VecDeque::new())),
-            port: Mutex::new(port),
+            settings: Mutex::new(Settings {
+                port,
+                ..Settings::default()
+            }),
             _lock: lock,
         })
+    }
+
+    #[tokio::test]
+    async fn settings_persist_without_mutating_running_config_or_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let relay = isolated(root.path(), 0).await;
+        relay.start().await.unwrap();
+        let port = relay.status().await.unwrap()["port"].as_u64().unwrap() as u16;
+        let result = relay.configure(json!({"port":port,"defaults":{"model":"configured-model","reasoning":"high","instructions_mode":"minimal","instructions":"Owner instructions"},"labels":{"primary":"Work"}})).await.unwrap();
+        assert_eq!(result["restart_required"], true);
+        assert_ne!(
+            relay.running.lock().await.as_ref().unwrap().config.model,
+            "configured-model"
+        );
+        let persisted = fs::read(root.path().join("settings.json")).unwrap();
+        assert!(relay.configure(json!({"port":0})).await.is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            persisted
+        );
+        relay.stop().await.unwrap();
+        relay.start().await.unwrap();
+        assert_eq!(relay.status().await.unwrap()["restart_required"], false);
+        {
+            let running = relay.running.lock().await;
+            let config = &running.as_ref().unwrap().config;
+            assert_eq!(config.model, "configured-model");
+            assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+            assert!(config.minimal_instructions());
+            assert!(config
+                .user_instructions
+                .as_deref()
+                .unwrap()
+                .contains("Owner instructions"));
+        }
+        let value = relay
+            .configure(json!({"appearance":{"theme":"dark"}}))
+            .await
+            .unwrap();
+        assert_eq!(value["restart_required"], false);
+        let saved = Settings::load(root.path()).unwrap();
+        assert_eq!(saved.labels.primary, "Work");
+        assert_eq!(saved.defaults.model, "configured-model");
+        relay.stop().await.unwrap();
+        assert!(!root.path().join("auth.json").exists());
     }
 
     #[tokio::test]
@@ -403,19 +491,38 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let relay = isolated(root.path(), 0).await;
         relay.start().await.unwrap();
-        let address: ControlAddress = serde_json::from_slice(&fs::read(descriptor(root.path())).unwrap()).unwrap();
+        let address: ControlAddress =
+            serde_json::from_slice(&fs::read(descriptor(root.path())).unwrap()).unwrap();
         let base = format!("http://127.0.0.1:{}", address.port);
         let client = reqwest::Client::new();
-        for route in ["/v1/chat/completions", "/v1/images/generations", "/v1/images/edits"] {
+        for route in [
+            "/v1/chat/completions",
+            "/v1/images/generations",
+            "/v1/images/edits",
+        ] {
             for key in [None, Some("relay"), Some("wrong-key")] {
                 let mut request = client.post(format!("{base}{route}")).json(&json!({}));
-                if let Some(key) = key { request = request.bearer_auth(key); }
+                if let Some(key) = key {
+                    request = request.bearer_auth(key);
+                }
                 assert_eq!(request.send().await.unwrap().status(), 401, "{route}");
             }
         }
         let image_catalog = format!("{base}/v1/images/models");
-        assert_eq!(client.get(&image_catalog).send().await.unwrap().status(), 401);
-        assert_eq!(client.get(&image_catalog).bearer_auth("test-relay-client-key").send().await.unwrap().status(), 200);
+        assert_eq!(
+            client.get(&image_catalog).send().await.unwrap().status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(&image_catalog)
+                .bearer_auth("test-relay-client-key")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
         relay.stop().await.unwrap();
     }
 
@@ -498,6 +605,7 @@ struct Command {
     op: String,
     slot: Option<String>,
     port: Option<u16>,
+    settings: Option<Value>,
 }
 async fn control_handler(
     State((relay, token)): State<(Arc<Relay>, String)>,
@@ -519,10 +627,16 @@ async fn control_handler(
         });
         return (StatusCode::OK, Json(json!({"stopping":true})));
     }
-    match relay
-        .command(&command.op, command.slot.as_deref(), command.port)
-        .await
-    {
+    let result = if command.op == "configure" {
+        relay
+            .configure(command.settings.unwrap_or(Value::Null))
+            .await
+    } else {
+        relay
+            .command(&command.op, command.slot.as_deref(), command.port)
+            .await
+    };
+    match result {
         Ok(value) => (StatusCode::OK, Json(value)),
         Err(e) => (
             StatusCode::CONFLICT,
@@ -549,7 +663,7 @@ pub async fn cli() -> Result<()> {
         return Ok(());
     }
     if matches!(action, "help" | "--help" | "-h") {
-        println!("Praxis Relay {}\nHeadless: serve [--headless]\nControls: status | login [primary|secondary] | cancel_login | logout primary|secondary|all | switch primary|secondary | limits primary|secondary | stop\nConfig: RELAY_AUTH_DIR, RELAY_PORT, RELAY_API_KEY, RELAY_PYTHON, RELAY_CODEX_VERSION\nNative desktop: praxis-relay-desktop",env!("CARGO_PKG_VERSION"));
+        println!("Praxis Relay {}\nHeadless: serve [--headless]\nControls: status | login [primary|secondary] | cancel_login | logout primary|secondary|all | switch primary|secondary | limits primary|secondary | models | stop\nSettings: configure <patch.json> (works offline and against a running process)\nConfig: RELAY_AUTH_DIR, RELAY_PORT, RELAY_API_KEY, RELAY_PYTHON, RELAY_CODEX_VERSION\nNative desktop: praxis-relay-desktop",env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if !matches!(
@@ -565,10 +679,19 @@ pub async fn cli() -> Result<()> {
             | "switch"
             | "limits"
             | "stop"
+            | "configure"
+            | "models"
     ) {
         bail!("Unknown command {action}; use --help");
     }
     let serve = matches!(action, "serve" | "server" | "run" | "--headless");
+    let settings = if action == "configure" {
+        Some(serde_json::from_str::<Value>(&fs::read_to_string(
+            args.get(1).context("Use configure <patch.json>")?,
+        )?)?)
+    } else {
+        None
+    };
     let slot = args
         .get(1)
         .filter(|a| !a.starts_with('-'))
@@ -585,6 +708,7 @@ pub async fn cli() -> Result<()> {
                     op: action.into(),
                     slot,
                     port: None,
+                    settings,
                 })
                 .timeout(std::time::Duration::from_secs(30))
                 .send()
@@ -609,7 +733,11 @@ pub async fn cli() -> Result<()> {
         relay.cancel_login().await;
         relay.stop().await?;
     } else {
-        let value = relay.command(action, slot.as_deref(), None).await?;
+        let value = if action == "configure" {
+            relay.configure(settings.unwrap()).await?
+        } else {
+            relay.command(action, slot.as_deref(), None).await?
+        };
         if action == "login" {
             while relay.login_state.lock().await.pending {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;

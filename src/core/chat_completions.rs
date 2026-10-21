@@ -816,7 +816,12 @@ pub async fn stream_chat_completions(
         // able to say what stands there -- RELAY_INSTRUCTIONS_FILE.
         let instructions = match crate::core::config::custom_instructions() {
             Some(text) => text,
-            None if minimal => MINIMAL_INSTRUCTIONS.to_string(),
+            None if minimal => match &config.user_instructions {
+                Some(text) => format!(
+                    "{MINIMAL_INSTRUCTIONS}\n\n<user_instructions>\n{text}\n</user_instructions>"
+                ),
+                None => MINIMAL_INSTRUCTIONS.to_string(),
+            },
             None => full_instructions.clone(),
         };
 

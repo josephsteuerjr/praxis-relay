@@ -62,7 +62,7 @@ impl Config {
         Ok(Config {
             codex_home,
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            model: "gpt-5.4".to_string(), // Default, but can be changed to any gpt-5* variant
+            model: std::env::var("RELAY_DEFAULT_MODEL").unwrap_or_default(),
             user_instructions,
             reasoning_effort,
             instructions_mode,
