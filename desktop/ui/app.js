@@ -19,6 +19,7 @@ function quotaPanel(slot){
   if(result.error)return `<div class="quota-error">${escape(result.error)}</div>`;
   let html=quotaWindow(result.rate_limit?.primary_window,"Основное окно")+quotaWindow(result.rate_limit?.secondary_window,"Недельное окно");
   for(const extra of result.additional_rate_limits||[]){html+=`<div class="quota-note">${escape(extra.limit_name||extra.name||"Дополнительная квота")}</div>`+quotaWindow(extra.rate_limit?.primary_window,"Основное окно")+quotaWindow(extra.rate_limit?.secondary_window,"Недельное окно");}
+  if(result.fetched_at)html+=`<div class="quota-note">Обновлено ${escape(new Date(result.fetched_at).toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}))}</div>`;
   return html;
 }
 function accountCard(account,detailed){
@@ -33,6 +34,7 @@ function renderAccounts(force=false){
 }
 function render(next){
   const previousPending=state?.login?.pending;state=next;
+  if(previousPending&&!state.login.pending&&!state.login.error&&state.login.slot)delete limits[state.login.slot];
   for(const account of state.accounts){const identity=JSON.stringify([account.email,account.plan,account.configured]);if(identities[account.slot]!==identity){delete limits[account.slot];identities[account.slot]=identity;}}
   $("sidebar-version").textContent=`Praxis Relay ${state.version}`;
   $("server-badge").textContent=state.running?"● API работает":"● API остановлен";$("server-badge").classList.toggle("online",state.running);

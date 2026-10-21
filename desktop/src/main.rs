@@ -40,6 +40,25 @@ fn main() {
             // Open the management window even before login or when the API port
             // is occupied. An actionable startup error remains visible in the UI.
             app.manage(relay);
+            if let Some(window) = app.get_webview_window("main") {
+                if let Some(monitor) = window.current_monitor()? {
+                    let area = monitor.work_area();
+                    let scale = monitor.scale_factor();
+                    let width = (area.size.width as f64 / scale - 32.0).max(1.0).min(1120.0);
+                    let height = (area.size.height as f64 / scale - 32.0).max(1.0).min(760.0);
+                    window.set_min_size(Some(tauri::LogicalSize::new(
+                        width.min(720.0),
+                        height.min(560.0),
+                    )))?;
+                    window.set_size(tauri::LogicalSize::new(width, height))?;
+                    window.set_position(tauri::PhysicalPosition::new(
+                        area.position.x
+                            + (area.size.width as f64 - width * scale).max(0.0) as i32 / 2,
+                        area.position.y
+                            + (area.size.height as f64 - height * scale).max(0.0) as i32 / 2,
+                    ))?;
+                }
+            }
             let open = MenuItem::with_id(app, "open", "Открыть Praxis Relay", true, None::<&str>)?;
             let quit =
                 MenuItem::with_id(app, "quit", "Выйти и остановить реле", true, None::<&str>)?;

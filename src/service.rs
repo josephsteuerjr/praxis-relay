@@ -127,9 +127,13 @@ impl Relay {
     pub fn start(self: &Arc<Self>) -> futures_util::future::BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let mut running = self.running.lock().await;
-            if running.is_some() {
+            if running
+                .as_ref()
+                .is_some_and(|server| !server.task.is_finished())
+            {
                 return Ok(());
             }
+            *running = None;
             let port = *self.port.lock().await;
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,port)).await
             .with_context(|| format!("Port {port} is already in use or unavailable. Stop its owner or choose another port."))?;

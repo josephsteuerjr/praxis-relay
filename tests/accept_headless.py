@@ -42,7 +42,8 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1",0));port=listener.getsockname()[1]
     env=dict(os.environ,RELAY_AUTH_DIR=str(auth),RELAY_PORT=str(port),RELAY_NO_BROWSER="1",
-             RELAY_CODEX_VERSION="0.163.0",RELAY_MODEL_DISCOVERY="off")
+             RELAY_CODEX_VERSION="0.163.0",RELAY_MODEL_DISCOVERY="off",
+             HTTPS_PROXY="http://127.0.0.1:1",HTTP_PROXY="http://127.0.0.1:1",NO_PROXY="127.0.0.1,localhost")
     env.pop("RELAY_API_KEY",None);env.pop("RELAY_PYTHON",None)
     check("Praxis Relay" in subprocess.check_output([str(binary),"--version"],env=env,text=True),"version names the independent product")
     with (root/"process.log").open("wb") as log:
@@ -72,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
                 home.mkdir(parents=True,exist_ok=True)
                 payload=dict(OPENAI_API_KEY=None,tokens=dict(
                     id_token=token({"email":slot+"@example.invalid","https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}),
-                    access_token=token({"exp":int(time.time())+3600}),refresh_token="synthetic-refresh-"+slot,
+                    access_token="opaque-synthetic-access-"+slot,refresh_token="synthetic-refresh-"+slot,
                     account_id="synthetic-account-"+slot),last_refresh=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()))
                 (home/"auth.json").write_text(json.dumps(payload))
             write_account("primary");write_account("secondary")

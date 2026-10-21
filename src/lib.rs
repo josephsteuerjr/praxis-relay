@@ -97,7 +97,6 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "model_catalog": state.catalog.status().await,
         "codex_client_version": chat_completions::codex_cli_version(),
         "upstream_protocol_version": chat_completions::codex_cli_version(),
-        "auth_directory": state.config.codex_home,
     });
     info!("✅ Health check response: {}", response);
     Json(response)
