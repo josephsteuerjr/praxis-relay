@@ -10,7 +10,7 @@ svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <circle cx="32" cy="32" r="9"/>
 <path d="M32 13v8m0 22v8M13 32h8m22 0h8M18.5 18.5l5.7 5.7m15.6 15.6 5.7 5.7M18.5 45.5l5.7-5.7m15.6-15.6 5.7-5.7"/>
 </g></svg>'''
-(root.parent/'ui/icon.svg').write_text(svg, encoding='utf-8', newline='\n')
+(root/'icon.svg').write_text(svg, encoding='utf-8', newline='\n')
 factor=8
 image=Image.new('RGBA',(64*factor,64*factor))
 draw=ImageDraw.Draw(image)

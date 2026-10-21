@@ -186,7 +186,6 @@ small {
   display: flex;
   align-items: center;
   padding-left: 18px;
-  border-bottom: 1px solid var(--line);
   user-select: none;
   gap: 18px;
 }
@@ -227,13 +226,7 @@ aside {
   gap: 10px;
   margin: 0 0 38px;
 }
-.brand-mark {
-  width: 30px;
-  height: 30px;
-  color: var(--accent);
-  flex-shrink: 0;
-  stroke-width: 1.6;
-}
+
 .brand strong {
   font:
     550 1.03rem/1.2 Golos,
@@ -850,9 +843,7 @@ body[data-motion="false"] *:after {
   .brand {
     gap: 8px;
   }
-  .brand-mark {
-    width: 30px;
-  }
+
   .brand small {
     font-size: 0.58rem;
   }
@@ -912,9 +903,7 @@ body[data-motion="false"] *:after {
   .sidebar-bottom {
     display: none;
   }
-  .brand-mark {
-    width: 32px;
-  }
+
   nav button {
     justify-content: center;
     padding: 11px 0;

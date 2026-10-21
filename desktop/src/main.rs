@@ -76,6 +76,9 @@ fn main() {
             let preferences = tauri::async_runtime::block_on(relay.preferences());
             app.manage(relay.clone());
             if let Some(window) = app.get_webview_window("main") {
+                if let Some(icon) = app.default_window_icon() {
+                    window.set_icon(icon.clone())?;
+                }
                 if let Some(monitor) = window.current_monitor()? {
                     let area = monitor.work_area();
                     let scale = monitor.scale_factor();
