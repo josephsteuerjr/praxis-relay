@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             client_key=command("status")["api_key"]
             patch=root/"patch.json"
             patch.write_text(json.dumps({"appearance":{"theme":"dark","scale":115},"labels":{"primary":"Work"},"defaults":{"model":"configured-model","reasoning":"high"}}))
-            completed=subprocess.run([str(binary),"configure",str(patch)],env=env,capture_output=True,text=True,timeout=15)
+            completed=subprocess.run([str(binary),"configure",str(patch)],env=env,capture_output=True,text=True,encoding="utf-8",timeout=15)
             configured=json.loads(completed.stdout)
             check(completed.returncode==0 and configured["settings"]["appearance"]["theme"]=="dark" and configured["restart_required"],"CLI configures the running service and reports pending API changes")
             saved=(auth/"settings.json").read_bytes()
@@ -118,9 +118,9 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             check(not any(a["configured"] for a in command("status")["accounts"]),"logout all removes both slots")
             check(command("status")["api_key"]==client_key,"account logout preserves the client key")
             check(request("/health")[0]==200,"management stays alive after last logout")
-            completed=subprocess.run([str(binary),"status"],env=env,capture_output=True,text=True,timeout=15)
+            completed=subprocess.run([str(binary),"status"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=15)
             check(completed.returncode==0 and json.loads(completed.stdout)["running"],"a second CLI controls the live process")
-            completed=subprocess.run([str(binary),"stop"],env=env,capture_output=True,text=True,timeout=15)
+            completed=subprocess.run([str(binary),"stop"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=15)
             check(completed.returncode==0,"headless stop command succeeds")
             check(process.wait(timeout=10)==0,"headless service exits cleanly")
             check(not (auth/"control.json").exists(),"stop removes its control capability")

@@ -47,6 +47,8 @@ let state = null,
   toastTimer,
   saveQueue = Promise.resolve();
 const systemTheme = matchMedia("(prefers-color-scheme: dark)");
+const drafts = new Map(),
+  inputTimers = new Map();
 function problem(error) {
   const raw = String(error);
   let message =
@@ -99,6 +101,7 @@ async function invoke(op, slot = null, port = null, settings = null) {
 }
 async function windowAction(action) {
   try {
+    if (action === "quit") await flushSettings();
     await window.__TAURI__.core.invoke("window_command", { action });
   } catch (error) {
     notice(String(error));
@@ -262,7 +265,7 @@ function syncSettings() {
   )) {
     const path = input.dataset.setting,
       value = path.split(".").reduce((o, k) => o?.[k], prefs);
-    if (document.activeElement !== input) {
+    if (document.activeElement !== input && !drafts.has(path)) {
       if (input.type === "checkbox") input.checked = !!value;
       else input.value = value ?? "";
     }
@@ -285,8 +288,16 @@ function syncSettings() {
     ". Пока он не пуст, он заменяет базовый контекст и дополнения. Изменения файла действуют на следующий запрос.";
 }
 function render(next) {
+  const initial = !state;
   const previousPending = state?.login?.pending;
   state = next;
+  if (initial) {
+    const startupError = state.events.find((e) =>
+      e.message.startsWith("API startup failed: "),
+    );
+    if (startupError)
+      notice(startupError.message.slice("API startup failed: ".length));
+  }
   for (const a of state.accounts) {
     const identity = JSON.stringify([a.email, a.plan, a.configured]);
     if (identities[a.slot] !== identity) {
@@ -349,7 +360,8 @@ function render(next) {
   }
 }
 async function action(op, slot = null) {
-  if (busy || settingsPending) return;
+  if (busy) return;
+  await flushSettings();
   busy = true;
   notice("");
   try {
@@ -403,7 +415,9 @@ function saveSetting(path, value) {
   saveQueue = saveQueue.then(async () => {
     try {
       notice("");
-      render(await invoke("configure", null, null, patch));
+      const next = await invoke("configure", null, null, patch);
+      if (drafts.get(path) === value) drafts.delete(path);
+      render(next);
       $("save-state").textContent = "Сохранено";
     } catch (error) {
       notice(String(error));
@@ -414,9 +428,9 @@ function saveSetting(path, value) {
     }
   });
 }
-document.addEventListener("change", (event) => {
-  const input = event.target;
+function commitInput(input) {
   if (!input.dataset.setting || !state) return;
+  clearTimeout(inputTimers.get(input));
   if (input.checkValidity && !input.checkValidity()) {
     input.reportValidity();
     return;
@@ -427,7 +441,40 @@ document.addEventListener("change", (event) => {
       : input.hasAttribute("data-number")
         ? Number(input.value)
         : input.value;
+  const saved = input.dataset.setting
+    .split(".")
+    .reduce((o, k) => o?.[k], state.settings);
+  if (saved === value && !settingsPending) {
+    drafts.delete(input.dataset.setting);
+    return;
+  }
+  drafts.set(input.dataset.setting, value);
   saveSetting(input.dataset.setting, value);
+}
+async function flushSettings() {
+  for (const input of document.querySelectorAll(
+    "input[data-setting],textarea[data-setting]",
+  )) {
+    if (drafts.has(input.dataset.setting)) commitInput(input);
+  }
+  await saveQueue;
+}
+document.addEventListener("change", (event) => commitInput(event.target));
+document.addEventListener("input", (event) => {
+  const input = event.target;
+  if (
+    !input.dataset.setting ||
+    input.type === "checkbox" ||
+    input.tagName === "SELECT"
+  )
+    return;
+  drafts.set(input.dataset.setting, input.value);
+  $("save-state").textContent = "Сохраняем…";
+  clearTimeout(inputTimers.get(input));
+  inputTimers.set(
+    input,
+    setTimeout(() => commitInput(input), 500),
+  );
 });
 document.addEventListener("click", async (event) => {
   const b = event.target.closest("button");
