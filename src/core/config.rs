@@ -1,4 +1,3 @@
-use dirs::home_dir;
 use std::path::{Path, PathBuf};
 
 pub const RELAY_INSTRUCTIONS_FILE_ENV_VAR: &str = "RELAY_INSTRUCTIONS_FILE";
@@ -54,45 +53,11 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let codex_home = find_codex_home();
-
-        // Load user instructions from AGENTS.md
+        let codex_home = auth_root()?;
         let user_instructions = Self::load_instructions(Some(&codex_home));
         let reasoning_effort = Self::load_reasoning_effort();
         let instructions_mode = Self::load_instructions_mode();
         let parallel_tool_calls = Self::load_parallel_tool_calls();
-
-        // Check if auth.json exists in ./local_auth directory (fallback)
-        let local_auth_dir = std::env::current_dir()?.join("local_auth");
-        let local_auth_file = local_auth_dir.join("auth.json");
-        let primary_profile = local_auth_dir
-            .join("accounts")
-            .join("primary")
-            .join("auth.json");
-        if local_auth_file.exists() || primary_profile.exists() {
-            return Ok(Config {
-                codex_home: local_auth_dir,
-                chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                model: "gpt-5.4".to_string(),
-                user_instructions,
-                reasoning_effort,
-                instructions_mode: instructions_mode.clone(),
-                parallel_tool_calls,
-            });
-        }
-        // Check if auth.json exists in the current directory (legacy fallback)
-        let current_dir_auth = std::env::current_dir()?.join("auth.json");
-        if current_dir_auth.exists() {
-            return Ok(Config {
-                codex_home: std::env::current_dir()?,
-                chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                model: "gpt-5.4".to_string(),
-                user_instructions,
-                reasoning_effort,
-                instructions_mode: instructions_mode.clone(),
-                parallel_tool_calls,
-            });
-        }
 
         Ok(Config {
             codex_home,
@@ -165,22 +130,18 @@ impl Config {
     }
 }
 
-fn find_codex_home() -> PathBuf {
-    // Try to find codex home directory for Codex Proxy Server and Opencode integration
-    if let Some(home) = home_dir() {
-        // First check for .codex directory (Codex Proxy Server CLI compatibility)
-        let codex_home = home.join(".codex");
-        if codex_home.exists() {
-            return codex_home;
-        }
-
-        // Then check for .opencode directory (Opencode integration default)
-        let opencode_home = home.join(".opencode");
-        if opencode_home.exists() {
-            return opencode_home;
-        }
+/// Standalone credentials belong to the relay installation. Embedding hosts
+/// retain their explicit working-directory contract through RELAY_LOCAL.
+pub fn auth_root() -> std::io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("RELAY_AUTH_DIR").filter(|p| !p.is_empty()) {
+        return std::path::absolute(path);
     }
-
-    // Fallback to current directory
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    if crate::login::lib::relay_local() {
+        return Ok(std::env::current_dir()?.join("local_auth"));
+    }
+    let exe = std::env::current_exe()?;
+    Ok(exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("executable has no directory"))?
+        .join("local_auth"))
 }

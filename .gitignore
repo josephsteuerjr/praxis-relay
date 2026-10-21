@@ -20,3 +20,6 @@ src.bak-toolfix/
 # Editor and backup junk
 *.rs.bk
 *.log
+__pycache__/
+*.py[cod]
+/desktop/gen/

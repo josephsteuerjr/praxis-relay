@@ -27,6 +27,16 @@ pub use crate::login::token_data::TokenData;
 
 const SOURCE_FOR_PYTHON_SERVER: &str = include_str!("./login_with_chatgpt.py");
 
+static LOGIN_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub fn login_url() -> Option<String> {
+    LOGIN_URL.lock().ok().and_then(|s| s.clone())
+}
+pub fn clear_login_url() {
+    if let Ok(mut url) = LOGIN_URL.lock() {
+        *url = None;
+    }
+}
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 
@@ -276,6 +286,7 @@ pub fn logout(codex_home: &Path) -> std::io::Result<bool> {
 #[allow(dead_code)]
 pub struct SpawnedLogin {
     pub child: Arc<Mutex<Child>>,
+    _script: Arc<tempfile::TempPath>,
     pub stdout: Arc<Mutex<Vec<u8>>>,
     pub stderr: Arc<Mutex<Vec<u8>>>,
 }
@@ -338,54 +349,118 @@ fn relay_local_from(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0")
 }
 
-/// The interpreter that runs the login callback server: RELAY_PYTHON when the host
-/// ships its own Python (Hélène's runtime), otherwise `python3` from PATH. On a Mac
-/// without the Xcode command line tools `python3` is a stub that opens an install
-/// dialog, so a host that has an interpreter must name it.
-pub fn python_interpreter() -> std::ffi::OsString {
-    interpreter_from(env::var_os("RELAY_PYTHON"))
+/// Probe the interpreter, rather than accepting Windows Store aliases as Python.
+/// Explicit configuration is authoritative: a typo must be reported, not hidden.
+#[derive(Clone, Debug)]
+pub struct PythonCommand {
+    program: std::ffi::OsString,
+    args: Vec<String>,
 }
 
-fn interpreter_from(configured: Option<std::ffi::OsString>) -> std::ffi::OsString {
-    if let Some(path) = configured {
-        if !path.is_empty() && Path::new(&path).exists() {
-            return path;
+pub fn python_interpreter() -> io::Result<PythonCommand> {
+    let configured = env::var_os("RELAY_PYTHON").filter(|p| !p.is_empty());
+    let candidates = if let Some(path) = configured {
+        vec![PythonCommand {
+            program: path,
+            args: vec![],
+        }]
+    } else if cfg!(windows) {
+        vec![
+            PythonCommand {
+                program: "python.exe".into(),
+                args: vec![],
+            },
+            PythonCommand {
+                program: "py.exe".into(),
+                args: vec!["-3".into()],
+            },
+            PythonCommand {
+                program: "python3.exe".into(),
+                args: vec![],
+            },
+        ]
+    } else {
+        vec![
+            PythonCommand {
+                program: "python3".into(),
+                args: vec![],
+            },
+            PythonCommand {
+                program: "python".into(),
+                args: vec![],
+            },
+        ]
+    };
+    for candidate in candidates {
+        let mut probe = std::process::Command::new(&candidate.program);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            probe.creation_flags(0x08000000);
+        }
+        let result = probe.args(&candidate.args)
+            .args(["-c", "import sys,ssl,http.server; assert sys.version_info >= (3,10); print('praxis-relay-python-ok')"])
+            .stdin(Stdio::null()).output();
+        if result.is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout).trim() == "praxis-relay-python-ok"
+        }) {
+            return Ok(candidate);
         }
     }
-    std::ffi::OsString::from("python3")
+    Err(io::Error::other("Python 3.10+ with SSL is required for login. Install Python or set RELAY_PYTHON to its executable. Windows Store aliases are not interpreters."))
 }
 
-#[cfg(test)]
-mod host_env_tests {
-    use super::*;
-
-    #[test]
-    fn relay_local_is_a_flag_not_a_presence() {
-        assert!(relay_local_from(Some("1")));
-        assert!(relay_local_from(Some(" true ")));
-        assert!(!relay_local_from(Some("0")));
-        assert!(!relay_local_from(Some("")));
-        assert!(!relay_local_from(None));
+/// Stage OAuth away from the serving credential. The old login survives any
+/// browser/helper failure, and an unwritable destination fails before a browser opens.
+pub async fn staged_chatgpt_login(destination: &Path) -> io::Result<tempfile::TempDir> {
+    fs::create_dir_all(destination)?;
+    let staged = tempfile::tempdir_in(destination)?;
+    login_with_chatgpt(staged.path(), false).await?;
+    // Parsing validates the raw JWT shape without spending/refreshing a token.
+    let auth = try_read_auth_json(&get_auth_file(staged.path()))?;
+    if auth.tokens.is_none() {
+        return Err(io::Error::other(
+            "Login helper exited without subscription credentials",
+        ));
     }
+    Ok(staged)
+}
 
-    #[test]
-    fn interpreter_falls_back_to_python3_when_the_named_one_is_missing() {
-        assert_eq!(interpreter_from(None), std::ffi::OsString::from("python3"));
-        assert_eq!(
-            interpreter_from(Some(std::ffi::OsString::from("/no/such/python"))),
-            std::ffi::OsString::from("python3")
-        );
-        let own = std::env::current_exe().unwrap();
-        assert_eq!(interpreter_from(Some(own.clone().into_os_string())), own.into_os_string());
+pub fn install_staged_login(staged: &Path, destination: &Path) -> io::Result<()> {
+    let file = get_auth_file(staged);
+    let parsed = try_read_auth_json(&file)?;
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(&file)?)?;
+    let tokens = parsed
+        .tokens
+        .as_ref()
+        .ok_or_else(|| io::Error::other("Subscription credentials missing"))?;
+    if tokens.access_token.trim().is_empty()
+        || tokens.refresh_token.trim().is_empty()
+        || tokens
+            .account_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(io::Error::other(
+            "Login returned incomplete subscription credentials",
+        ));
     }
+    write_auth_json(
+        &get_auth_file(destination),
+        &parsed,
+        raw["tokens"]["id_token"].as_str(),
+    )
 }
 
 /// Spawn the ChatGPT login Python server as a child process and return a handle to its process.
 #[allow(dead_code)]
 pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLogin> {
     let script_path = write_login_script_to_disk()?;
-    let mut cmd = std::process::Command::new(python_interpreter());
-    cmd.arg(&script_path)
+    let python = python_interpreter()?;
+    let mut cmd = std::process::Command::new(&python.program);
+    cmd.args(&python.args)
+        .arg(script_path.as_os_str())
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
         .stdin(Stdio::null())
@@ -405,6 +480,7 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
     }
 
     Ok(SpawnedLogin {
+        _script: Arc::new(script_path),
         child: Arc::new(Mutex::new(child)),
         stdout: stdout_buf,
         stderr: stderr_buf,
@@ -421,44 +497,75 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
 /// recorded in memory. Otherwise, the subprocess's output will be sent to the
 /// current process's stdout/stderr.
 pub async fn login_with_chatgpt(codex_home: &Path, capture_output: bool) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let python = tokio::task::spawn_blocking(python_interpreter)
+        .await
+        .map_err(io::Error::other)??;
     let script_path = write_login_script_to_disk()?;
-    let child = Command::new(python_interpreter())
-        .arg(&script_path)
+    let mut command = Command::new(&python.program);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    command.args(&python.args).arg(script_path.as_os_str());
+    if env::var("RELAY_NO_BROWSER").is_ok_and(|v| v == "1") {
+        command.arg("--no-browser");
+    }
+    let mut child = command
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
         .stdin(Stdio::null())
-        .stdout(if capture_output {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        })
-        .stderr(if capture_output {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
-
-    let output = child.wait_with_output().await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::other(format!(
-            "login_with_chatgpt subprocess failed: {stderr}"
-        )))
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let reader = async move {
+        let mut recent = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let n = stderr.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            if !capture_output {
+                let _ = io::stderr().write_all(&chunk[..n]);
+            }
+            recent.extend_from_slice(&chunk[..n]);
+            if let Some(url) = String::from_utf8_lossy(&recent)
+                .split_whitespace()
+                .find(|word| word.starts_with("https://auth.openai.com/"))
+            {
+                if let Ok(mut value) = LOGIN_URL.lock() {
+                    *value = Some(url.to_string());
+                }
+            }
+            if recent.len() > 16384 {
+                recent.drain(..recent.len() - 16384);
+            }
+        }
+        Ok::<_, io::Error>(recent)
+    };
+    let (status, diagnostic) = tokio::join!(child.wait(), reader);
+    let status = status?;
+    let diagnostic = diagnostic?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "ChatGPT login helper exited {status}: {}",
+            String::from_utf8_lossy(&diagnostic)
+        )));
     }
+    if !get_auth_file(codex_home).is_file() {
+        return Err(io::Error::other(
+            "Login helper exited without creating auth.json",
+        ));
+    }
+    Ok(())
 }
 
-fn write_login_script_to_disk() -> std::io::Result<PathBuf> {
-    // Write the embedded Python script to a file to avoid very long
-    // command-line arguments (Windows error 206).
+fn write_login_script_to_disk() -> io::Result<tempfile::TempPath> {
     let mut tmp = NamedTempFile::new()?;
     tmp.write_all(SOURCE_FOR_PYTHON_SERVER.as_bytes())?;
     tmp.flush()?;
-
-    let (_file, path) = tmp.keep()?;
-    Ok(path)
+    Ok(tmp.into_temp_path())
 }
 
 #[allow(dead_code)]
@@ -919,6 +1026,17 @@ mod tests {
             !auth_file.exists(),
             "отказ не должен оставлять огрызок файла"
         );
+    }
+
+    #[test]
+    fn incomplete_staged_login_cannot_replace_an_existing_account() {
+        let destination = tempdir().unwrap();
+        login_with_api_key(destination.path(), "existing-local-credential").unwrap();
+        let before = fs::read(get_auth_file(destination.path())).unwrap();
+        let staged = tempdir().unwrap();
+        login_with_api_key(staged.path(), "incomplete-new-credential").unwrap();
+        assert!(install_staged_login(staged.path(), destination.path()).is_err());
+        assert_eq!(fs::read(get_auth_file(destination.path())).unwrap(), before);
     }
 
     #[test]

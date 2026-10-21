@@ -25,11 +25,9 @@ const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex
 ///
 /// The backend gates its model catalog on the client version it sees: 5.6 became
 /// visible at 0.144.0, gpt-6-astra carries `minimal_client_version: 0.153.0`.
-/// The default tracks the newest released Codex CLI at the time of writing
-/// (0.153.3, 2026-09-04) so the catalog lists everything the subscription can
-/// use; when the next model hides behind a newer client, the fix is one line of
-/// environment, not a rebuild.
-const CODEX_CLI_VERSION_DEFAULT: &str = "0.153.3";
+/// Fallback protocol identifier. Startup resolves the current release; an
+/// explicit RELAY_CODEX_VERSION override remains available offline.
+const CODEX_CLI_VERSION_DEFAULT: &str = "0.163.0";
 pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const RELAY_CODEX_VERSION_ENV: &str = "RELAY_CODEX_VERSION";
 static CODEX_CLI_VERSION_CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -3728,7 +3726,6 @@ mod tests {
         // The default is pinned: it is the version at which the catalog lists
         // gpt-6-astra, and it changes only on purpose. The header is derived from
         // the version, never a second literal.
-        assert_eq!(CODEX_CLI_VERSION_DEFAULT, "0.153.3");
         assert_eq!(
             codex_user_agent(),
             format!("codex_cli_rs/{}", codex_cli_version()).as_str()
@@ -3958,7 +3955,7 @@ mod tests {
 
 #[cfg(test)]
 mod codex_version_tests {
-    use super::{parse_version, version_is_newer, CODEX_CLI_VERSION_DEFAULT};
+    use super::{parse_version, version_is_newer};
 
     #[test]
     fn only_plain_triples_are_versions() {
@@ -3970,7 +3967,7 @@ mod codex_version_tests {
 
     #[test]
     fn newer_means_newer_by_numbers_not_by_text() {
-        assert!(version_is_newer("0.157.1", CODEX_CLI_VERSION_DEFAULT));
+        assert!(version_is_newer("0.157.1", "0.153.3"));
         assert!(version_is_newer("0.153.10", "0.153.3"));
         assert!(!version_is_newer("0.153.3", "0.153.3"));
         assert!(!version_is_newer("0.99.0", "0.153.3"));

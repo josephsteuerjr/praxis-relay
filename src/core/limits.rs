@@ -32,6 +32,10 @@ struct CachedLimits {
 }
 
 impl LimitsCache {
+    pub(crate) async fn invalidate(&self, slot: &str) {
+        self.inner.lock().await.remove(slot);
+    }
+
     pub async fn get(&self, router: &AccountRouter) -> Result<Value> {
         // lease_any: сломанный активный слот не должен ослеплять и опрос лимитов —
         // он паркуется, и лимиты честно показываются с живого резерва.
@@ -63,7 +67,7 @@ impl LimitsCache {
         Ok(value)
     }
 
-    async fn get_for_account(&self, account: &AccountLease) -> Result<Value> {
+    pub(crate) async fn get_for_account(&self, account: &AccountLease) -> Result<Value> {
         // Holding this small async mutex through the refresh also prevents a
         // status-page burst from fanning out into several upstream requests.
         let mut guard = self.inner.lock().await;
@@ -95,6 +99,7 @@ async fn fetch_usage(account: &AccountLease) -> Result<Value> {
             crate::core::chat_completions::codex_user_agent(),
         )
         .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(Duration::from_secs(15))
         .send()
         .await
         .context("OpenAI usage request failed")?;

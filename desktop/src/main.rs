@@ -1,0 +1,141 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use praxis_relay::service::Relay;
+use serde_json::Value;
+use std::sync::Arc;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager,
+};
+
+#[tauri::command]
+async fn relay_command(
+    relay: tauri::State<'_, Arc<Relay>>,
+    op: String,
+    slot: Option<String>,
+    port: Option<u16>,
+) -> Result<Value, String> {
+    relay
+        .inner()
+        .command(&op, slot.as_deref(), port)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+fn show(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_skip_taskbar(false);
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn main() {
+    let application = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
+        .setup(|app| {
+            let relay = tauri::async_runtime::block_on(Relay::new())?;
+            // Open the management window even before login or when the API port
+            // is occupied. An actionable startup error remains visible in the UI.
+            app.manage(relay);
+            let open = MenuItem::with_id(app, "open", "Открыть Praxis Relay", true, None::<&str>)?;
+            let quit =
+                MenuItem::with_id(app, "quit", "Выйти и остановить реле", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let mut rgba = vec![0u8; 32 * 32 * 4];
+            for y in 0..32 {
+                for x in 0..32 {
+                    let i = (y * 32 + x) * 4;
+                    let inside = (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 210;
+                    rgba[i..i + 4].copy_from_slice(if inside {
+                        &[114, 96, 236, 255]
+                    } else {
+                        &[0, 0, 0, 0]
+                    });
+                    if (x > 12 && x < 19 && y > 6 && y < 26)
+                        || (y > 12 && y < 19 && x > 6 && x < 26)
+                    {
+                        rgba[i..i + 4].copy_from_slice(&[250, 248, 255, 255]);
+                    }
+                }
+            }
+            // If creating the tray fails, startup fails visibly instead of
+            // allowing the window to hide somewhere the user cannot restore it.
+            TrayIconBuilder::with_id("relay")
+                .icon(tauri::image::Image::new_owned(rgba, 32, 32))
+                .tooltip("Praxis Relay")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        show(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.set_skip_taskbar(true);
+                let _ = window.hide();
+            }
+            tauri::WindowEvent::Resized(_) => {
+                if window.is_minimized().unwrap_or(false) {
+                    let _ = window.set_skip_taskbar(true);
+                    let _ = window.hide();
+                }
+            }
+            _ => {}
+        })
+        .invoke_handler(tauri::generate_handler![relay_command])
+        .build(tauri::generate_context!());
+    let application = match application {
+        Ok(application) => application,
+        Err(error) => {
+            let message = format!("Unable to open Praxis Relay:\n\n{error}");
+            #[cfg(windows)]
+            {
+                #[link(name = "user32")]
+                unsafe extern "system" {
+                    fn MessageBoxW(
+                        window: *mut std::ffi::c_void,
+                        text: *const u16,
+                        title: *const u16,
+                        kind: u32,
+                    ) -> i32;
+                }
+                let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+                let title: Vec<u16> = "Praxis Relay".encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10);
+                }
+            }
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    application.run(|app, event| {
+        if let tauri::RunEvent::Exit = event {
+            let relay = app.state::<Arc<Relay>>();
+            tauri::async_runtime::block_on(async {
+                relay.cancel_login().await;
+                let _ = relay.stop().await;
+            });
+        }
+    });
+}

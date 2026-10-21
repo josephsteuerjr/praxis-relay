@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use crate::login::lib::{AuthMode, CodexAuth};
 
 const STATE_SCHEMA: &str = "relay.account-router.v1";
-const ACCOUNT_SLOTS: [&str; 2] = ["primary", "secondary"];
+pub const ACCOUNT_SLOTS: [&str; 2] = ["primary", "secondary"];
 const DEFAULT_COOLDOWN_SECONDS: u64 = 15 * 60;
 
 #[derive(Clone)]
@@ -32,6 +32,7 @@ pub struct AccountRouter {
     accounts: Arc<Vec<AccountProfile>>,
     state: Arc<Mutex<PersistentState>>,
     state_file: Arc<PathBuf>,
+    auth_root: Arc<PathBuf>,
     cooldown: Duration,
     #[cfg(test)]
     lease_gate: Arc<std::sync::Mutex<Option<Arc<TestGate>>>>,
@@ -153,6 +154,12 @@ struct AccountProfile {
     refresh_lock: Mutex<()>,
 }
 
+impl AccountProfile {
+    fn configured(&self) -> bool {
+        self.auth_home.join("auth.json").is_file()
+    }
+}
+
 /// One internally consistent credential snapshot.  It intentionally has no
 /// `Debug` implementation so bearer tokens cannot be logged by accident.
 pub struct AccountLease {
@@ -165,6 +172,7 @@ pub struct AccountLease {
 #[derive(Clone, Debug, Serialize)]
 pub struct SlotView {
     pub slot: String,
+    pub configured: bool,
     pub active: bool,
     pub cooldown_seconds_left: i64,
 }
@@ -179,36 +187,42 @@ struct PersistentState {
 
 impl AccountRouter {
     pub async fn load(auth_root: &Path) -> Result<Self> {
+        let router = Self::open(auth_root).await?;
+        router
+            .lease_any()
+            .await
+            .context("no usable ChatGPT account profile")?;
+        Ok(router)
+    }
+
+    /// Start the control surface even when every account is logged out.
+    pub async fn open(auth_root: &Path) -> Result<Self> {
         let accounts_root = auth_root.join("accounts");
         let mut accounts = Vec::new();
         for slot in ACCOUNT_SLOTS {
-            let auth_home = accounts_root.join(slot);
-            if auth_home.join("auth.json").is_file() {
-                accounts.push(AccountProfile {
-                    slot: slot.to_string(),
-                    auth_home,
-                    refresh_lock: Mutex::new(()),
-                });
-            }
-        }
-
-        // Backward compatibility keeps the current deployment viable while the
-        // first profile is migrated into accounts/primary.
-        if accounts.is_empty() && auth_root.join("auth.json").is_file() {
+            let profile = accounts_root.join(slot);
+            // Preserve the old single-account layout without duplicating its tokens.
+            let auth_home = if slot == "primary" && !profile.join("auth.json").is_file() {
+                auth_root.to_path_buf()
+            } else {
+                profile
+            };
             accounts.push(AccountProfile {
-                slot: "primary".to_string(),
-                auth_home: auth_root.to_path_buf(),
+                slot: slot.to_string(),
+                auth_home,
                 refresh_lock: Mutex::new(()),
             });
-        }
-        if accounts.is_empty() {
-            bail!("no ChatGPT account profiles are configured");
         }
 
         let state_file = std::env::var_os("RELAY_ACCOUNT_STATE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| auth_root.join("router-state.json"));
-        let first_slot = accounts[0].slot.clone();
+        let first_slot = accounts
+            .iter()
+            .find(|a| a.configured())
+            .unwrap_or(&accounts[0])
+            .slot
+            .clone();
         let mut state = if state_file.exists() {
             let bytes = fs::read(&state_file).context("failed to read account router state")?;
             let state: PersistentState =
@@ -224,7 +238,10 @@ impl AccountRouter {
                 exhausted_until: BTreeMap::new(),
             }
         };
-        if !accounts.iter().any(|account| account.slot == state.active) {
+        if !accounts
+            .iter()
+            .any(|account| account.slot == state.active && account.configured())
+        {
             warn!("persisted account slot is unavailable; selecting the first configured slot");
             state.active = first_slot;
         }
@@ -238,6 +255,7 @@ impl AccountRouter {
             accounts: Arc::new(accounts),
             state: Arc::new(Mutex::new(state.clone())),
             state_file: Arc::new(state_file),
+            auth_root: Arc::new(auth_root.to_path_buf()),
             cooldown: Duration::from_secs(cooldown_seconds),
             #[cfg(test)]
             lease_gate: Arc::new(std::sync::Mutex::new(None)),
@@ -246,14 +264,6 @@ impl AccountRouter {
         };
         router.persist(&state)?;
 
-        // Startup survives a broken ACTIVE profile as long as any slot leases:
-        // 13.08 the corrupt active file crashed the whole process in a restart
-        // loop while a healthy standby sat next to it.  lease_any parks the
-        // broken slot and moves on; only "no usable slot at all" fails startup.
-        router
-            .lease_any()
-            .await
-            .context("no usable ChatGPT account profile")?;
         info!(
             "account router ready: active={}, configured={}",
             router.active_slot().await,
@@ -263,7 +273,7 @@ impl AccountRouter {
     }
 
     pub fn account_count(&self) -> usize {
-        self.accounts.len()
+        self.accounts.iter().filter(|a| a.configured()).count()
     }
 
     pub async fn active_slot(&self) -> String {
@@ -315,7 +325,8 @@ impl AccountRouter {
             self.accounts
                 .iter()
                 .find(|account| {
-                    account.slot != active
+                    account.configured()
+                        && account.slot != active
                         && state
                             .exhausted_until
                             .get(&account.slot)
@@ -394,7 +405,8 @@ impl AccountRouter {
             self.accounts
                 .iter()
                 .find(|account| {
-                    account.slot != exhausted.slot
+                    account.configured()
+                        && account.slot != exhausted.slot
                         && state
                             .exhausted_until
                             .get(&account.slot)
@@ -456,7 +468,8 @@ impl AccountRouter {
                     .unwrap_or(0);
                 SlotView {
                     slot: account.slot.clone(),
-                    active: account.slot == state.active,
+                    configured: account.configured(),
+                    active: account.slot == state.active && account.configured(),
                     cooldown_seconds_left: (until - now).max(0),
                 }
             })
@@ -475,7 +488,11 @@ impl AccountRouter {
     /// decision outranks a guess.  Genuine exhaustion re-arms it on the next 429.
     pub async fn switch_to(&self, slot: &str) -> Result<AccountLease> {
         let wanted = slot.trim();
-        if !self.accounts.iter().any(|account| account.slot == wanted) {
+        if !self
+            .accounts
+            .iter()
+            .any(|account| account.slot == wanted && account.configured())
+        {
             let configured: Vec<&str> = self
                 .accounts
                 .iter()
@@ -486,9 +503,6 @@ impl AccountRouter {
                 wanted,
                 configured.join(", ")
             );
-        }
-        if self.active_slot().await == wanted {
-            return self.lease_slot(wanted).await;
         }
         let target = self
             .lease_slot(wanted)
@@ -509,7 +523,67 @@ impl AccountRouter {
         Ok(target)
     }
 
-    async fn lease_slot(&self, slot: &str) -> Result<AccountLease> {
+    pub fn auth_home(&self, slot: &str) -> Result<&Path> {
+        self.accounts
+            .iter()
+            .find(|a| a.slot == slot)
+            .map(|a| a.auth_home.as_path())
+            .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))
+    }
+
+    /// Share the refresh lock with login/logout so refresh cannot resurrect a
+    /// removed credential file. Existing requests may finish their leased turn.
+    pub async fn logout(&self, slot: &str) -> Result<bool> {
+        let account = self
+            .accounts
+            .iter()
+            .find(|a| a.slot == slot)
+            .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))?;
+        let _guard = account.refresh_lock.lock().await;
+        let mut removed = crate::login::lib::logout(&account.auth_home)?;
+        if slot == "primary" {
+            // Remove both historical representations of this slot. Otherwise a
+            // restart could silently resurrect an ignored legacy auth.json.
+            removed |= crate::login::lib::logout(&self.auth_root)?;
+            removed |= crate::login::lib::logout(&self.auth_root.join("accounts/primary"))?;
+        }
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.exhausted_until.remove(slot);
+        if next.active == slot {
+            if let Some(other) = self
+                .accounts
+                .iter()
+                .find(|a| a.slot != slot && a.configured())
+            {
+                next.active = other.slot.clone();
+            }
+        }
+        self.persist(&next)?;
+        *state = next;
+        Ok(removed)
+    }
+
+    pub async fn login(&self, slot: &str) -> Result<()> {
+        let account = self
+            .accounts
+            .iter()
+            .find(|a| a.slot == slot)
+            .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))?;
+        // OAuth is staged away from live credentials. A failed/cancelled login
+        // leaves the previous account usable; only the final replace is locked.
+        let staged = crate::login::lib::staged_chatgpt_login(&account.auth_home).await?;
+        let _guard = account.refresh_lock.lock().await;
+        crate::login::lib::install_staged_login(staged.path(), &account.auth_home)?;
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.exhausted_until.remove(slot);
+        self.persist(&next)?;
+        *state = next;
+        Ok(())
+    }
+
+    pub(crate) async fn lease_slot(&self, slot: &str) -> Result<AccountLease> {
         #[cfg(test)]
         self.stop_at_gate(&self.lease_gate).await;
         let account = self
@@ -645,6 +719,76 @@ mod tests {
             serde_json::to_vec_pretty(&auth).unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_relay_accepts_credentials_without_restart_and_logout_removes_them() {
+        let root = tempdir().unwrap();
+        let router = AccountRouter::open(root.path()).await.unwrap();
+        assert_eq!(router.account_count(), 0);
+        assert!(router.lease_any().await.is_err());
+        write_account(root.path(), "secondary", "acct-secondary");
+        assert_eq!(
+            router.switch_to("secondary").await.unwrap().account_id,
+            "acct-secondary"
+        );
+        assert_eq!(router.account_count(), 1);
+        router.logout("secondary").await.unwrap();
+        assert_eq!(router.account_count(), 0);
+        assert!(router.lease_any().await.is_err());
+        assert_eq!(
+            AccountRouter::open(root.path())
+                .await
+                .unwrap()
+                .account_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_account_can_be_added_and_selected_while_serving() {
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        write_account(root.path(), "secondary", "acct-secondary");
+        assert_eq!(router.account_count(), 2);
+        router.switch_to("secondary").await.unwrap();
+        router.logout("secondary").await.unwrap();
+        assert_eq!(router.lease_any().await.unwrap().account_id, "acct-primary");
+    }
+
+    #[tokio::test]
+    async fn logout_cannot_resurrect_shadow_legacy_credentials_after_restart() {
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        fs::copy(
+            root.path().join("accounts/primary/auth.json"),
+            root.path().join("auth.json"),
+        )
+        .unwrap();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        router.logout("primary").await.unwrap();
+        assert_eq!(
+            AccountRouter::open(root.path())
+                .await
+                .unwrap()
+                .account_count(),
+            0
+        );
+        assert!(!root.path().join("auth.json").exists());
+    }
+
+    #[tokio::test]
+    async fn logout_rejects_paths_and_preserves_other_slots() {
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        let original = fs::read(root.path().join("accounts/primary/auth.json")).unwrap();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        assert!(router.logout("../../.codex").await.is_err());
+        assert_eq!(
+            fs::read(root.path().join("accounts/primary/auth.json")).unwrap(),
+            original
+        );
     }
 
     #[tokio::test]

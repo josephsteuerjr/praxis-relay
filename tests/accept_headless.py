@@ -1,0 +1,117 @@
+"""Exercise a packaged headless process with isolated synthetic credentials."""
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+binary = Path(sys.argv[1]).resolve()
+assert binary.is_file()
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+foreign = Path.home()/".codex/auth.json"
+before = digest(foreign)
+checks=[]
+def check(condition,name):
+    assert condition,name
+    checks.append(name)
+
+def wait_for(predicate,timeout=15):
+    until=time.monotonic()+timeout
+    while time.monotonic()<until:
+        value=predicate()
+        if value:return value
+        time.sleep(.1)
+    raise AssertionError("Timed out waiting for relay state")
+
+def token(payload):
+    return "e30."+base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")+".c2ln"
+
+with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
+    root=Path(temporary)
+    auth=root/"auth";auth.mkdir()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1",0));port=listener.getsockname()[1]
+    env=dict(os.environ,RELAY_AUTH_DIR=str(auth),RELAY_PORT=str(port),RELAY_NO_BROWSER="1",
+             RELAY_CODEX_VERSION="0.163.0",RELAY_MODEL_DISCOVERY="off")
+    env.pop("RELAY_API_KEY",None);env.pop("RELAY_PYTHON",None)
+    check("Praxis Relay" in subprocess.check_output([str(binary),"--version"],env=env,text=True),"version names the independent product")
+    with (root/"process.log").open("wb") as log:
+        process=subprocess.Popen([str(binary),"serve","--headless"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
+        try:
+            wait_for(lambda:(auth/"control.json").is_file())
+            address=json.loads((auth/"control.json").read_text())
+            def request(path,body=None,key=True,origin=None):
+                headers={}
+                if key:headers["x-relay-control"]=address["token"]
+                if origin:headers["Origin"]=origin
+                if body is not None:headers["Content-Type"]="application/json"
+                req=urllib.request.Request(f"http://127.0.0.1:{port}"+path,
+                    data=json.dumps(body).encode() if body is not None else None,headers=headers)
+                try:
+                    with urllib.request.urlopen(req,timeout=5) as response:return response.status,json.load(response)
+                except urllib.error.HTTPError as error:return error.code,json.load(error)
+            def command(op,slot=None):
+                status,value=request("/_relay/control",dict(op=op,slot=slot,port=None))
+                assert status==200,(op,value)
+                return value
+            check(command("status")["running"],"starts without credentials")
+            check(request("/_relay/control",dict(op="logout",slot="all"),key=False)[0]==403,"anonymous controls are rejected")
+            check(request("/_relay/control",dict(op="logout",slot="all"),origin="https://invalid.example")[0]==403,"browser origins are rejected")
+            def write_account(slot):
+                home=auth if slot=="primary" else auth/"accounts"/slot
+                home.mkdir(parents=True,exist_ok=True)
+                payload=dict(OPENAI_API_KEY=None,tokens=dict(
+                    id_token=token({"email":slot+"@example.invalid","https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}),
+                    access_token=token({"exp":int(time.time())+3600}),refresh_token="synthetic-refresh-"+slot,
+                    account_id="synthetic-account-"+slot),last_refresh=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()))
+                (home/"auth.json").write_text(json.dumps(payload))
+            write_account("primary");write_account("secondary")
+            status=command("status")
+            check(all(a["configured"] for a in status["accounts"]),"both late credentials are discovered")
+            check("synthetic-refresh" not in json.dumps(status),"status never exposes subscription tokens")
+            command("switch","secondary")
+            check(next(a for a in command("status")["accounts"] if a["active"])["slot"]=="secondary","live switching selects the second account")
+            command("logout","secondary")
+            check(next(a for a in command("status")["accounts"] if a["active"])["slot"]=="primary","logout selects the remaining account")
+            # Exercise the actual interpreter discovery/helper startup without
+            # opening a browser or contacting the identity provider.
+            original=(auth/"auth.json").read_bytes()
+            with socket.socket() as callback:
+                callback_free=callback.connect_ex(("127.0.0.1",1455))!=0
+            if callback_free:
+                command("login","primary")
+                status=wait_for(lambda: (value if (value:=command("status")).get("login_url") or not value["login"]["pending"] else None))
+                check(bool(status.get("login_url")),"a real Python interpreter starts the OAuth callback")
+                command("cancel_login")
+                check((auth/"auth.json").read_bytes()==original,"cancelled sign-in preserves the old account")
+                def callback_closed():
+                    with socket.socket() as probe:return probe.connect_ex(("127.0.0.1",1455))!=0
+                check(wait_for(callback_closed),"cancellation releases the OAuth callback port")
+            else:
+                checks.append("OAuth port occupied: interpreter smoke explicitly skipped")
+            command("logout","all")
+            check(not any(a["configured"] for a in command("status")["accounts"]),"logout all removes both slots")
+            check(request("/health")[0]==200,"management stays alive after last logout")
+            completed=subprocess.run([str(binary),"status"],env=env,capture_output=True,text=True,timeout=15)
+            check(completed.returncode==0 and json.loads(completed.stdout)["running"],"a second CLI controls the live process")
+            completed=subprocess.run([str(binary),"stop"],env=env,capture_output=True,text=True,timeout=15)
+            check(completed.returncode==0,"headless stop command succeeds")
+            check(process.wait(timeout=10)==0,"headless service exits cleanly")
+            check(not (auth/"control.json").exists(),"stop removes its control capability")
+        finally:
+            if process.poll() is None:
+                try:command("cancel_login")
+                except Exception:pass
+                process.terminate();process.wait(timeout=10)
+check(digest(foreign)==before,"Codex authentication is unchanged")
+print(json.dumps(dict(passed=True,checks=checks),indent=2))
