@@ -76,6 +76,11 @@ impl Relay {
         let config = Arc::new(Config::load()?);
         fs::create_dir_all(&config.codex_home)
             .context("Relay data directory is not writable; set RELAY_AUTH_DIR")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config.codex_home, fs::Permissions::from_mode(0o700))?;
+        }
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -727,7 +732,7 @@ pub async fn cli() -> Result<()> {
         relay.start().await?;
         println!("Praxis Relay {} · {}\nFully headless. Use a second terminal for controls; Ctrl+C stops this process.",env!("CARGO_PKG_VERSION"),relay.status().await?["base_url"].as_str().unwrap_or(""));
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>{},
+            _=shutdown_signal()=>{},
             _=async { while relay.running.lock().await.is_some() { tokio::time::sleep(std::time::Duration::from_millis(250)).await; } }=>{}
         }
         relay.cancel_login().await;
@@ -752,4 +757,15 @@ pub async fn cli() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=term.recv()=>{} }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

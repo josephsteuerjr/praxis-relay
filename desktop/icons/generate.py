@@ -20,6 +20,7 @@ for line in [(32,13,32,21),(32,43,32,51),(13,32,21,32),(43,32,51,32),(18.5,18.5,
     points=[(line[0]*factor,line[1]*factor),(line[2]*factor,line[3]*factor)]
     draw.line(points,fill=ink,width=3*factor)
     for x,y in points:draw.ellipse((x-1.5*factor,y-1.5*factor,x+1.5*factor,y+1.5*factor),fill=ink)
+image.save(root/'icon.icns')
 image=image.resize((256,256),Image.Resampling.LANCZOS)
 image.save(root/'icon.png')
 image.save(root/'icon.ico',sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])

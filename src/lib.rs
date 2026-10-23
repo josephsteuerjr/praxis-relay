@@ -15,6 +15,7 @@ mod chat_response;
 #[cfg(test)]
 mod chat_response_tests;
 mod core;
+pub use core::config::auth_root;
 mod local_key;
 mod login;
 pub mod service;

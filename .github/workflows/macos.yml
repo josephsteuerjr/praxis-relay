@@ -1,0 +1,98 @@
+name: macOS native ports
+on:
+  push:
+    branches: ['codex/relay-unix-ports-2310']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: relay-macos-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '13.3'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        run: rustup default 1.94.1
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: relay-macos-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-macos-${{ matrix.arch }}-
+      - name: Offline OAuth and Rust tests
+        run: |
+          python3 -m unittest discover -s tests -p test_login_helper.py -v
+          cargo test --locked -j 2 -- --test-threads=1
+      - name: Build native executables
+        run: |
+          cargo build --release --locked -j 2 --bin praxis-relay-headless
+          cargo build --manifest-path desktop/Cargo.toml --release --locked -j 2 --target-dir target
+      - name: Accept actual native headless binary
+        run: |
+          python3 tests/accept_headless.py target/release/praxis-relay-headless
+          python3 tests/accept_unix.py target/release/praxis-relay-headless
+      - name: Prepare native application for acceptance
+        run: |
+          mkdir -p qa/praxis-relay.app/Contents/MacOS qa/praxis-relay.app/Contents/Resources
+          cp target/release/praxis-relay-{desktop,headless} qa/praxis-relay.app/Contents/MacOS/
+          cp desktop/icons/icon.icns qa/praxis-relay.app/Contents/Resources/
+          python3 -c 'import plistlib,pathlib; p=pathlib.Path("qa/praxis-relay.app/Contents/Info.plist"); p.write_bytes(plistlib.dumps(dict(CFBundleIdentifier="app.helene.relay",CFBundleName="praxis-relay",CFBundleExecutable="praxis-relay-desktop",CFBundlePackageType="APPL",CFBundleIconFile="icon.icns",NSHighResolutionCapable=True)))'
+          codesign --force --deep --sign - qa/praxis-relay.app
+      - name: Accept actual native desktop
+        run: python3 tests/accept_desktop.py qa/praxis-relay.app/Contents/MacOS/praxis-relay-desktop qa/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out qa/evidence
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: relay-macos-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            target/release/praxis-relay-desktop
+            target/release/praxis-relay-headless
+            qa/evidence
+          retention-days: 7
+  universal:
+    needs: native
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: relay-macos-*-${{ github.sha }}
+          path: inputs
+      - name: Combine, package and verify both architectures
+        run: |
+          mkdir universal
+          for name in praxis-relay-desktop praxis-relay-headless; do
+            lipo -create "inputs/relay-macos-arm64-${GITHUB_SHA}/target/release/$name" "inputs/relay-macos-x86_64-${GITHUB_SHA}/target/release/$name" -output "universal/$name"
+            chmod 755 "universal/$name"
+          done
+          python3 packaging/bundle.py mac --out dist --binaries universal
+          codesign --verify --deep --strict dist/praxis-relay.app
+          hdiutil verify dist/*.dmg
+          python3 tests/accept_headless.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless
+          python3 tests/accept_desktop.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-desktop dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out universal-evidence
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: praxis-relay-macos-universal-${{ github.sha }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+            universal-evidence
+          retention-days: 14
