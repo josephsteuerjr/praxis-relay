@@ -9,6 +9,7 @@ parser.add_argument('--out',type=Path,required=True)
 args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=True)
 desktop=args.desktop.resolve();headless=args.headless.resolve()
 version=tomllib.loads((Path(__file__).resolve().parent.parent/'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+identifier=json.loads((Path(__file__).resolve().parent.parent/'desktop/tauri.conf.json').read_text(encoding='utf-8'))['identifier']
 checks=[]
 def check(condition,name):
     assert condition,name
@@ -17,7 +18,8 @@ def run(*cmd,**kwargs):return subprocess.check_output(list(map(str,cmd)),encodin
 def wait_for(function):
     until=time.monotonic()+40
     while time.monotonic()<until:
-        value=function()
+        try:value=function()
+        except subprocess.CalledProcessError:value=None
         if value:return value
         time.sleep(.2)
     raise AssertionError('Native desktop acceptance timed out')
@@ -63,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='relay-native-') as temporary:
         else:
             run('screencapture','-x',args.out/'native-light.png')
             # Standard Quit AppleEvent requires no Accessibility automation grant.
-            run('osascript','-e','tell application id "app.helene.relay" to quit')
+            run('osascript','-e',f'tell application id "{identifier}" to quit')
             check(process.wait(timeout=15)==0,'native application Quit stops the window and service')
         check(not (auth/'control.json').exists(),'native exit removes the control capability')
         check((auth/'api-key.txt').read_text().strip()==key,'native exit preserves the client key')

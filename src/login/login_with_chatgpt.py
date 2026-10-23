@@ -28,6 +28,7 @@ import http.server
 import json
 import os
 import secrets
+import socketserver
 import sys
 import tempfile
 import threading
@@ -360,6 +361,13 @@ class PkceCodes:
 
 class _ApiKeyHTTPServer(http.server.HTTPServer):
     """HTTPServer with shutdown helper & self-contained OAuth configuration."""
+
+    def server_bind(self) -> None:
+        # HTTPServer normally reverse-resolves its bind address. This callback
+        # only serves loopback; macOS DNS timeouts must not block browser login.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
     def __init__(
         self,

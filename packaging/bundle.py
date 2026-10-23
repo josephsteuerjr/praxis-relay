@@ -13,6 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = tomllib.loads((ROOT/'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+IDENTIFIER = json.loads((ROOT/'desktop/tauri.conf.json').read_text(encoding='utf-8'))['identifier']
 DOCS = ['README.md', 'ПАМЯТКА.md', 'LICENSE', 'LICENSE-APACHE', 'NOTICE', 'packaging/README.md']
 
 def run(*args):
@@ -55,11 +56,11 @@ def linux(args):
     stage=out/'linux-root';stage.mkdir(exist_ok=True)
     for name in ('praxis-relay-desktop','praxis-relay-headless'):
         copy(args.binaries/name,stage/'usr/bin'/name,True)
-    entry=stage/'usr/share/applications/app.helene.relay.desktop'
+    entry=stage/f'usr/share/applications/{IDENTIFIER}.desktop'
     entry.parent.mkdir(parents=True,exist_ok=True)
-    entry.write_text('[Desktop Entry]\nType=Application\nName=praxis-relay\nComment=Local subscription API and account manager\nExec=praxis-relay-desktop\nIcon=app.helene.relay\nTerminal=false\nCategories=Development;Utility;\nStartupNotify=true\nStartupWMClass=praxis-relay-desktop\n',encoding='utf-8')
-    copy(ROOT/'desktop/icons/icon.png',stage/'usr/share/icons/hicolor/256x256/apps/app.helene.relay.png')
-    copy(ROOT/'desktop/icons/icon.svg',stage/'usr/share/icons/hicolor/scalable/apps/app.helene.relay.svg')
+    entry.write_text(f'[Desktop Entry]\nType=Application\nName=praxis-relay\nComment=Local subscription API and account manager\nExec=praxis-relay-desktop\nIcon={IDENTIFIER}\nTerminal=false\nCategories=Development;Utility;\nStartupNotify=true\nStartupWMClass=praxis-relay-desktop\n',encoding='utf-8')
+    copy(ROOT/'desktop/icons/icon.png',stage/f'usr/share/icons/hicolor/256x256/apps/{IDENTIFIER}.png')
+    copy(ROOT/'desktop/icons/icon.svg',stage/f'usr/share/icons/hicolor/scalable/apps/{IDENTIFIER}.svg')
     docdir=stage/'usr/share/doc/praxis-relay';docs(docdir)
     passport(docdir,'x86_64-unknown-linux-gnu',args.commit)
     # Record executable hashes too: the installed passport is outside /usr/bin.
@@ -100,9 +101,9 @@ tar -xzf %{{SOURCE0}} -C %{{buildroot}}
 %files
 /usr/bin/praxis-relay-desktop
 /usr/bin/praxis-relay-headless
-/usr/share/applications/app.helene.relay.desktop
-/usr/share/icons/hicolor/256x256/apps/app.helene.relay.png
-/usr/share/icons/hicolor/scalable/apps/app.helene.relay.svg
+/usr/share/applications/{IDENTIFIER}.desktop
+/usr/share/icons/hicolor/256x256/apps/{IDENTIFIER}.png
+/usr/share/icons/hicolor/scalable/apps/{IDENTIFIER}.svg
 %doc /usr/share/doc/praxis-relay
 ''',encoding='utf-8')
         run('rpmbuild','--define','_topdir '+str(top.resolve()),'-bb',spec)
@@ -119,7 +120,7 @@ def mac(args):
     copy(ROOT/'desktop/icons/icon.icns',contents/'Resources/icon.icns')
     docs(contents/'Resources/docs')
     metadata=dict(CFBundleName='praxis-relay',CFBundleDisplayName='praxis-relay',
-                  CFBundleIdentifier='app.helene.relay',CFBundleExecutable='praxis-relay-desktop',
+                  CFBundleIdentifier=IDENTIFIER,CFBundleExecutable='praxis-relay-desktop',
                   CFBundlePackageType='APPL',CFBundleIconFile='icon.icns',
                   CFBundleShortVersionString=VERSION,CFBundleVersion=VERSION,
                   LSMinimumSystemVersion='13.3',NSHighResolutionCapable=True,
@@ -136,6 +137,10 @@ def mac(args):
     for binary in (contents/'MacOS').iterdir():
         architectures=set(run('lipo','-archs',binary).split())
         assert architectures=={'arm64','x86_64'},architectures
+        for line in run('otool','-L',binary).splitlines():
+            if line.startswith('\t'):
+                library=line.strip().split(' (',1)[0]
+                assert library.startswith(('/usr/lib/','/System/Library/')),library
     archive=out/f'praxis-relay-{VERSION}-macos-universal.zip'
     run('ditto','-c','-k','--sequesterRsrc','--keepParent',app,archive)
     image=out/'dmg-root';image.mkdir(exist_ok=True)

@@ -73,7 +73,7 @@ fn main() {
     root.to_string_lossy().to_lowercase().hash(&mut identity);
     #[cfg(not(windows))]
     root.hash(&mut identity);
-    let instance = format!("app.helene.relay.profile{:016x}", identity.finish());
+    let instance = format!("{}.profile{:016x}", context.config().identifier, identity.finish());
     #[cfg(not(target_os = "linux"))]
     { context.config_mut().identifier = instance.clone(); }
     let application = tauri::Builder::default()

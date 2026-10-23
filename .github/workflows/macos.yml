@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Rust toolchain
         run: rustup default 1.94.1
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -51,10 +52,17 @@ jobs:
           mkdir -p qa/praxis-relay.app/Contents/MacOS qa/praxis-relay.app/Contents/Resources
           cp target/release/praxis-relay-{desktop,headless} qa/praxis-relay.app/Contents/MacOS/
           cp desktop/icons/icon.icns qa/praxis-relay.app/Contents/Resources/
-          python3 -c 'import plistlib,pathlib; p=pathlib.Path("qa/praxis-relay.app/Contents/Info.plist"); p.write_bytes(plistlib.dumps(dict(CFBundleIdentifier="app.helene.relay",CFBundleName="praxis-relay",CFBundleExecutable="praxis-relay-desktop",CFBundlePackageType="APPL",CFBundleIconFile="icon.icns",NSHighResolutionCapable=True)))'
+          python3 -c 'import plistlib,pathlib,json; p=pathlib.Path("qa/praxis-relay.app/Contents/Info.plist"); c=json.loads(pathlib.Path("desktop/tauri.conf.json").read_text()); p.write_bytes(plistlib.dumps(dict(CFBundleIdentifier=c["identifier"],CFBundleName="praxis-relay",CFBundleExecutable="praxis-relay-desktop",CFBundlePackageType="APPL",CFBundleIconFile="icon.icns",NSHighResolutionCapable=True)))'
           codesign --force --deep --sign - qa/praxis-relay.app
       - name: Accept actual native desktop
         run: python3 tests/accept_desktop.py qa/praxis-relay.app/Contents/MacOS/praxis-relay-desktop qa/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out qa/evidence
+      - uses: actions/cache/save@v6
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -86,6 +94,11 @@ jobs:
           hdiutil verify dist/*.dmg
           python3 tests/accept_headless.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless
           python3 tests/accept_desktop.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-desktop dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out universal-evidence
+          mkdir "$RUNNER_TEMP/relay-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/relay-mounted" dist/*.dmg
+          python3 tests/accept_unix.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless"
+          python3 tests/accept_desktop.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-desktop" "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless" --out mounted-evidence
+          hdiutil detach "$RUNNER_TEMP/relay-mounted"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -95,4 +108,5 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             universal-evidence
+            mounted-evidence
           retention-days: 14
