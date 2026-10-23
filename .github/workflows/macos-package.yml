@@ -61,11 +61,11 @@ jobs:
           codesign --verify --deep --strict dist/praxis-relay.app
           hdiutil verify dist/*.dmg
           python3 tests/accept_headless.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless
-          python3 tests/accept_desktop.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-desktop dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out universal-evidence
+          python3 packaging/accept_mac.py dist/praxis-relay.app --out universal-evidence
           mkdir "$RUNNER_TEMP/relay-mounted"
           hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/relay-mounted" dist/*.dmg
           python3 tests/accept_unix.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless"
-          python3 tests/accept_desktop.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-desktop" "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless" --out mounted-evidence
+          python3 packaging/accept_mac.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app" --out mounted-evidence
           hdiutil detach "$RUNNER_TEMP/relay-mounted"
       - uses: actions/upload-artifact@v7
         if: always()
