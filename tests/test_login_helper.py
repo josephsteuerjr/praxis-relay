@@ -31,6 +31,17 @@ def bundle():
 
 
 class LoginContracts(unittest.TestCase):
+    def test_loopback_callback_does_not_depend_on_reverse_dns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("socket.getfqdn", side_effect=AssertionError("Loopback must not perform reverse DNS")):
+                server = helper._ApiKeyHTTPServer(("127.0.0.1", 0), helper._ApiKeyHTTPHandler,
+                                                  codex_home=directory, client_id="mock-client")
+                try:
+                    self.assertEqual(server.server_name, "localhost")
+                    self.assertGreater(server.server_port, 0)
+                finally:
+                    server.server_close()
+
     def test_subscription_signin_exchanges_only_the_authorization_code(self):
         handler = object.__new__(helper._ApiKeyHTTPHandler)
         handler.server = types.SimpleNamespace(token_endpoint="https://identity.invalid/oauth/token",

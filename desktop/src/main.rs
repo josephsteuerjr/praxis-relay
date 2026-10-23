@@ -8,6 +8,8 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
+mod platform;
+use platform::show;
 
 #[tauri::command]
 async fn relay_command(
@@ -31,6 +33,7 @@ async fn relay_command(
         .map_err(|e| format!("{e:#}"))?;
     if value.get("product").is_some() {
         value["window_visible"] = Value::Bool(window.is_visible().unwrap_or(false));
+        value["tray_available"] = Value::Bool(platform::tray_available());
     }
     Ok(value)
 }
@@ -39,7 +42,7 @@ async fn relay_command(
 fn window_command(window: tauri::WebviewWindow, action: String) -> Result<bool, String> {
     let result = match action.as_str() {
         "drag" => window.start_dragging(),
-        "minimize" | "close" => window.set_skip_taskbar(true).and_then(|_| window.hide()),
+        "minimize" | "close" => platform::hide(window.app_handle()),
         "maximize" => window.is_maximized().and_then(|maximized| {
             if maximized {
                 window.unmaximize()
@@ -57,25 +60,34 @@ fn window_command(window: tauri::WebviewWindow, action: String) -> Result<bool, 
     Ok(window.is_maximized().unwrap_or(false))
 }
 
-fn show(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_skip_taskbar(false);
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-}
-
 fn main() {
+    let start_api = std::env::args().any(|argument| argument == "--start-api");
+    let minimized = std::env::args().any(|argument| argument == "--minimized");
+    let mut context = tauri::generate_context!();
+    let root = praxis_relay::auth_root().expect("Relay data directory unavailable");
+    std::fs::create_dir_all(&root).expect("Relay data directory is not writable");
+    let root = std::fs::canonicalize(root).expect("Relay data directory cannot be resolved");
+    use std::hash::{Hash, Hasher};
+    let mut identity = std::collections::hash_map::DefaultHasher::new();
+    #[cfg(windows)]
+    root.to_string_lossy().to_lowercase().hash(&mut identity);
+    #[cfg(not(windows))]
+    root.hash(&mut identity);
+    let instance = format!("{}.profile{:016x}", context.config().identifier, identity.finish());
+    #[cfg(not(target_os = "linux"))]
+    { context.config_mut().identifier = instance.clone(); }
     let application = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
-        .setup(|app| {
+        .plugin(tauri_plugin_single_instance::Builder::new().dbus_id(instance).callback(|app, _, _| show(app)).build())
+        .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_menu(tauri::menu::Menu::default(app.handle())?)?;
             let relay = tauri::async_runtime::block_on(Relay::new())?;
             // Open the management window even before login or when the API port
             // is occupied. An actionable startup error remains visible in the UI.
             let preferences = tauri::async_runtime::block_on(relay.preferences());
             app.manage(relay.clone());
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
                 if let Some(icon) = app.default_window_icon() {
                     window.set_icon(icon.clone())?;
                 }
@@ -111,7 +123,7 @@ fn main() {
                 .icon(icon)
                 .tooltip("praxis-relay")
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(cfg!(target_os = "linux"))
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show(app),
                     "quit" => app.exit(0),
@@ -130,7 +142,7 @@ fn main() {
                     }
                 })
                 .build(app)?;
-            let startup_ok = if preferences.auto_start_api {
+            let startup_ok = if preferences.auto_start_api || start_api {
                 match tauri::async_runtime::block_on(relay.start()) {
                     Ok(()) => true,
                     Err(error) => {
@@ -141,27 +153,30 @@ fn main() {
             } else {
                 true
             };
-            if !preferences.start_in_tray || !startup_ok {
+            if !(preferences.start_in_tray || minimized)
+                || !startup_ok
+                || !platform::tray_available()
+            {
                 show(app.handle());
+            } else {
+                platform::hide(app.handle())?;
             }
             Ok(())
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.set_skip_taskbar(true);
-                let _ = window.hide();
+                let _ = platform::hide(window.app_handle());
             }
             tauri::WindowEvent::Resized(_) => {
-                if window.is_minimized().unwrap_or(false) {
-                    let _ = window.set_skip_taskbar(true);
-                    let _ = window.hide();
+                if window.is_minimized().unwrap_or(false) && platform::tray_available() {
+                    let _ = platform::hide(window.app_handle());
                 }
             }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![relay_command, window_command])
-        .build(tauri::generate_context!());
+        .build(context);
     let application = match application {
         Ok(application) => application,
         Err(error) => {
@@ -188,6 +203,10 @@ fn main() {
         }
     };
     application.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if matches!(&event, tauri::RunEvent::Reopen { .. }) {
+            show(app);
+        }
         if let tauri::RunEvent::Exit = event {
             let relay = app.state::<Arc<Relay>>();
             tauri::async_runtime::block_on(async {

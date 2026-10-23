@@ -7,6 +7,20 @@ service for login, logout, quotas and account switching.
 The relay is an independent program. The displayed Codex version identifies the
 upstream protocol; Codex CLI is not an executable dependency.
 
+## Platform downloads
+
+Version 1.1 adds macOS **Intel + Apple Silicon** application bundles and a DMG,
+Linux x86_64 **DEB and RPM** packages, and standalone Unix headless archives.
+The same beige, frameless interface and shared account service run on each OS.
+Linux packages include both executables and integrate with the application menu.
+See [platform packaging and requirements](packaging/README.md).
+
+macOS bundles are signed ad hoc, not notarized with Apple Developer ID; macOS
+can require approval in Privacy & Security for an Internet download. The minimum
+macOS version is 13.3. The Linux desktop uses GTK 3 and WebKitGTK 4.1; DEB/RPM
+metadata installs the runtime dependencies. Debian 12 and Fedora 44 are the
+installed-package validation targets. A headless archive needs no display.
+
 ## Desktop
 
 Run `praxis-relay-desktop.exe`. The Russian interface provides two account slots,
@@ -63,7 +77,10 @@ Python **3.10+** is needed only for login. Windows discovery probes `python.exe`
 Store aliases are rejected. `RELAY_PYTHON` is an explicit executable override;
 an invalid override is reported rather than silently ignored.
 
-The data directory defaults to `local_auth` next to the executable.
+On Windows the data directory defaults to `local_auth` next to the executable.
+macOS uses `~/Library/Application Support/praxis-relay`; Linux uses
+`$XDG_DATA_HOME/praxis-relay` or `~/.local/share/praxis-relay`. Both GUI and CLI
+select the same path. A pre-existing adjacent `local_auth` remains portable.
 `RELAY_AUTH_DIR` overrides it. Embedding hosts with `RELAY_LOCAL=1` retain the
 working-directory `local_auth` contract. Login, serving, refresh and logout all
 use the same directory. The relay does not discover, borrow or modify credentials

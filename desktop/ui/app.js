@@ -336,6 +336,12 @@ function render(next) {
       : "Подключи подписку"
     : "Запусти API для подключения";
   $("auth-dir").textContent = state.auth_directory;
+  $("tray-hint").hidden = state.tray_available !== false;
+  for (const button of document.querySelectorAll('[data-window="minimize"], [data-window="close"]')) {
+    const label = state.tray_available === false ? "Свернуть окно" : "Убрать в трей";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+  }
   $("app-version").textContent = state.version;
   $("protocol-version").textContent = state.protocol_version;
   $("restart-banner").hidden = !state.restart_required;

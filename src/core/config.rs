@@ -14,6 +14,10 @@ pub fn instructions_file_path() -> PathBuf {
             return path;
         }
     }
+    #[cfg(unix)]
+    if let Ok(root) = auth_root() {
+        return root.join(DEFAULT_INSTRUCTIONS_FILE);
+    }
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(DEFAULT_INSTRUCTIONS_FILE)))
@@ -130,8 +134,8 @@ impl Config {
     }
 }
 
-/// Standalone credentials belong to the relay installation. Embedding hosts
-/// retain their explicit working-directory contract through RELAY_LOCAL.
+/// Installed Unix applications use per-user storage. Explicit embedding roots
+/// and pre-existing portable installations retain their existing contract.
 pub fn auth_root() -> std::io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("RELAY_AUTH_DIR").filter(|p| !p.is_empty()) {
         return std::path::absolute(path);
@@ -139,9 +143,92 @@ pub fn auth_root() -> std::io::Result<PathBuf> {
     if crate::login::lib::relay_local() {
         return Ok(std::env::current_dir()?.join("local_auth"));
     }
-    let exe = std::env::current_exe()?;
-    Ok(exe
+    default_auth_root(
+        &std::env::current_exe()?,
+        dirs::home_dir().as_deref(),
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+}
+
+fn default_auth_root(
+    exe: &Path,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let legacy = exe
         .parent()
         .ok_or_else(|| std::io::Error::other("executable has no directory"))?
-        .join("local_auth"))
+        .join("local_auth");
+    if cfg!(windows) || legacy.is_dir() {
+        return Ok(legacy);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = xdg;
+        home.map(|p| p.join("Library/Application Support/praxis-relay"))
+            .ok_or_else(|| std::io::Error::other("Home directory unavailable; set RELAY_AUTH_DIR"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = xdg.filter(|p| p.is_absolute()) {
+            return Ok(xdg.join("praxis-relay"));
+        }
+        home.map(|p| p.join(".local/share/praxis-relay"))
+            .ok_or_else(|| std::io::Error::other("Home directory unavailable; set RELAY_AUTH_DIR"))
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    #[test]
+    fn an_existing_portable_root_keeps_its_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("local_auth");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("auth.json"), "existing-account").unwrap();
+        assert_eq!(
+            default_auth_root(&root.path().join("relay"), None, None).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("auth.json")).unwrap(),
+            "existing-account"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn installed_application_uses_the_users_writable_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let actual =
+            default_auth_root(&root.path().join("system/bin/relay"), Some(&home), None).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            actual,
+            home.join("Library/Application Support/praxis-relay")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(actual, home.join(".local/share/praxis-relay"));
+        assert!(!actual.starts_with(root.path().join("system")));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn xdg_must_be_absolute_and_has_priority_over_home() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("bin/relay");
+        let home = root.path().join("home");
+        let xdg = root.path().join("data");
+        assert_eq!(
+            default_auth_root(&exe, Some(&home), Some(&xdg)).unwrap(),
+            xdg.join("praxis-relay")
+        );
+        assert_eq!(
+            default_auth_root(&exe, Some(&home), Some(Path::new("relative"))).unwrap(),
+            home.join(".local/share/praxis-relay")
+        );
+        assert!(default_auth_root(&exe, None, Some(Path::new("relative"))).is_err());
+    }
 }

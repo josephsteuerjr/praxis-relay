@@ -359,7 +359,7 @@ pub struct PythonCommand {
 
 pub fn python_interpreter() -> io::Result<PythonCommand> {
     let configured = env::var_os("RELAY_PYTHON").filter(|p| !p.is_empty());
-    let candidates = if let Some(path) = configured {
+    let mut candidates = if let Some(path) = configured.clone() {
         vec![PythonCommand {
             program: path,
             args: vec![],
@@ -391,6 +391,28 @@ pub fn python_interpreter() -> io::Result<PythonCommand> {
             },
         ]
     };
+    // Finder/.desktop launches do not inherit interactive shell PATH. Probe
+    // known installations directly, without running a shell or sourcing rc files.
+    #[cfg(unix)]
+    if configured.is_none() {
+        let mut locations = vec![
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/usr/local/bin/python3"),
+        ];
+        #[cfg(target_os = "macos")]
+        {
+            locations.insert(0, PathBuf::from("/opt/homebrew/bin/python3"));
+            if let Ok(versions) = fs::read_dir("/Library/Frameworks/Python.framework/Versions") {
+                for entry in versions.flatten() {
+                    locations.push(entry.path().join("bin/python3"));
+                }
+            }
+        }
+        candidates.extend(locations.into_iter().map(|path| PythonCommand {
+            program: path.into_os_string(),
+            args: vec![],
+        }));
+    }
     for candidate in candidates {
         let mut probe = std::process::Command::new(&candidate.program);
         #[cfg(windows)]
