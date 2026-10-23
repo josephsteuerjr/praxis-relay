@@ -42,7 +42,7 @@ async fn relay_command(
 fn window_command(window: tauri::WebviewWindow, action: String) -> Result<bool, String> {
     let result = match action.as_str() {
         "drag" => window.start_dragging(),
-        "minimize" | "close" => platform::hide(&window),
+        "minimize" | "close" => platform::hide(window.app_handle()),
         "maximize" => window.is_maximized().and_then(|maximized| {
             if maximized {
                 window.unmaximize()
@@ -158,19 +158,19 @@ fn main() {
                 || !platform::tray_available()
             {
                 show(app.handle());
-            } else if let Some(window) = app.get_webview_window("main") {
-                platform::hide(&window)?;
+            } else {
+                platform::hide(app.handle())?;
             }
             Ok(())
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = platform::hide(window);
+                let _ = platform::hide(window.app_handle());
             }
             tauri::WindowEvent::Resized(_) => {
                 if window.is_minimized().unwrap_or(false) && platform::tray_available() {
-                    let _ = platform::hide(window);
+                    let _ = platform::hide(window.app_handle());
                 }
             }
             _ => {}

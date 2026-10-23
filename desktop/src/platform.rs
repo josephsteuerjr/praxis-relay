@@ -1,5 +1,5 @@
 //! Native lifecycle differences, independent of account management.
-use tauri::{Manager, WebviewWindow};
+use tauri::Manager;
 
 #[cfg(target_os = "linux")]
 pub fn tray_available() -> bool {
@@ -41,7 +41,8 @@ pub fn tray_available() -> bool {
     true
 }
 
-pub fn hide(window: &WebviewWindow) -> tauri::Result<()> {
+pub fn hide(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(window) = app.get_window("main") else { return Ok(()); };
     if !tray_available() {
         return window.minimize();
     }
@@ -49,9 +50,7 @@ pub fn hide(window: &WebviewWindow) -> tauri::Result<()> {
     window.set_skip_taskbar(true)?;
     window.hide()?;
     #[cfg(target_os = "macos")]
-    window
-        .app_handle()
-        .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
     Ok(())
 }
 pub fn show(app: &tauri::AppHandle) {
