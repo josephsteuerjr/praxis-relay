@@ -42,7 +42,7 @@ pub fn tray_available() -> bool {
 }
 
 pub fn hide(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let Some(window) = app.get_window("main") else { return Ok(()); };
+    let Some(window) = app.get_webview_window("main") else { return Ok(()); };
     if !tray_available() {
         return window.minimize();
     }
