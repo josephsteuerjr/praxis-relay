@@ -2,6 +2,7 @@ name: macOS native ports
 on:
   push:
     branches: ['codex/relay-unix-ports-2310']
+    paths-ignore: ['packaging/**', '.github/workflows/macos*.yml']
   workflow_dispatch:
 permissions:
   contents: read

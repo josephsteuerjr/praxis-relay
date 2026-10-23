@@ -1,0 +1,82 @@
+name: macOS package accepted binaries
+on:
+  push:
+    branches: ['codex/relay-unix-ports-2310']
+    paths: ['packaging/**', '.github/workflows/macos-package.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: relay-macos-package-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Resolve an accepted build with identical Rust and frontend sources
+        id: source
+        run: |
+          python3 - <<'PY'
+          import json,os,subprocess
+          def gh(path): return json.loads(subprocess.check_output(['gh','api',path]))
+          root='repos/'+os.environ['GITHUB_REPOSITORY']
+          runs=gh(root+'/actions/workflows/macos.yml/runs?branch='+os.environ['GITHUB_REF_NAME']+'&per_page=30')['workflow_runs']
+          for run in runs:
+              jobs=gh(root+'/actions/runs/'+str(run['id'])+'/jobs')['jobs']
+              native=[j for j in jobs if j['name'].startswith('native (')]
+              arches={j['name'].rsplit(', ',1)[1].rstrip(')') for j in native if j['conclusion']=='success'}
+              if arches != {'arm64','x86_64'}: continue
+              different=subprocess.run(['git','diff','--quiet',run['head_sha'],'HEAD','--','Cargo.toml','Cargo.lock','src','desktop']).returncode
+              if different: continue
+              proof={'native_run_id':run['id'],'native_source_commit':run['head_sha'],'packaging_commit':os.environ['GITHUB_SHA'],'runtime_tree_identical':True,
+                     'native_jobs':[{'id':j['id'],'name':j['name'],'conclusion':j['conclusion']} for j in native]}
+              open('native-source.json','w').write(json.dumps(proof,indent=2))
+              with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('run='+str(run['id'])+'\nsha='+run['head_sha']+'\n')
+              print(json.dumps(proof));break
+          else: raise SystemExit('No accepted build with identical runtime sources; run native acceptance first')
+          PY
+      - uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.source.outputs.run }}
+          pattern: relay-macos-*-${{ steps.source.outputs.sha }}
+          path: inputs
+      - name: Combine, sign, package and accept the final Universal app and mounted DMG
+        env:
+          NATIVE_SOURCE: ${{ steps.source.outputs.sha }}
+        run: |
+          mkdir universal
+          for name in praxis-relay-desktop praxis-relay-headless; do
+            lipo -create "inputs/relay-macos-arm64-${NATIVE_SOURCE}/target/release/$name" "inputs/relay-macos-x86_64-${NATIVE_SOURCE}/target/release/$name" -output "universal/$name"
+            chmod 755 "universal/$name"
+          done
+          python3 packaging/bundle.py mac --out dist --binaries universal --commit "$NATIVE_SOURCE"
+          codesign --verify --deep --strict dist/praxis-relay.app
+          hdiutil verify dist/*.dmg
+          python3 tests/accept_headless.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless
+          python3 tests/accept_desktop.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-desktop dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out universal-evidence
+          mkdir "$RUNNER_TEMP/relay-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/relay-mounted" dist/*.dmg
+          python3 tests/accept_unix.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless"
+          python3 tests/accept_desktop.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-desktop" "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless" --out mounted-evidence
+          hdiutil detach "$RUNNER_TEMP/relay-mounted"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: praxis-relay-macos-universal-${{ github.sha }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+            dist/MACOS-BUILD-PASSPORT.json
+            native-source.json
+            universal-evidence
+            mounted-evidence
+          retention-days: 14

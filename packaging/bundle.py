@@ -127,13 +127,23 @@ def mac(args):
                   NSPrincipalClass='NSApplication',LSApplicationCategoryType='public.app-category.developer-tools')
     with (contents/'Info.plist').open('wb') as stream:plistlib.dump(metadata,stream)
     # Sign nested executables before sealing the finished app, never alter it later.
-    for binary in (contents/'MacOS').iterdir():run('codesign','--force','--sign','-',binary)
+    # codesign recognizes the main executable as its enclosing app. Sign the
+    # nested helper first so that signing the main app never sees unsigned code.
+    for name in ('praxis-relay-headless','praxis-relay-desktop'):
+        run('codesign','--force','--sign','-',contents/'MacOS'/name)
     value=passport(contents/'Resources','universal-apple-darwin',args.commit)
-    value['binaries']=[dict(path='Contents/MacOS/'+p.name,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
+    value['binaries']=[dict(path='Contents/MacOS/'+p.name,
                            architectures=run('lipo','-archs',p).split()) for p in sorted((contents/'MacOS').iterdir())]
+    value['packaging_commit']=os.environ.get('GITHUB_SHA',args.commit)
     (contents/'Resources/BUILD-PASSPORT.json').write_text(json.dumps(value,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
     run('codesign','--force','--sign','-',app)
     run('codesign','--verify','--deep','--strict',app)
+    # A main-executable hash inside sealed Resources would create a signature
+    # cycle. Record final signed hashes outside the app, after sealing it.
+    external=dict(value,binaries=[dict(entry,sha256=hashlib.sha256((app/entry['path']).read_bytes()).hexdigest()) for entry in value['binaries']],
+                  bundle='praxis-relay.app',resources_directory='Contents/Resources')
+    external_passport=out/'MACOS-BUILD-PASSPORT.json'
+    external_passport.write_text(json.dumps(external,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
     for binary in (contents/'MacOS').iterdir():
         architectures=set(run('lipo','-archs',binary).split())
         assert architectures=={'arm64','x86_64'},architectures
@@ -145,6 +155,7 @@ def mac(args):
     run('ditto','-c','-k','--sequesterRsrc','--keepParent',app,archive)
     image=out/'dmg-root';image.mkdir(exist_ok=True)
     run('ditto',app,image/app.name)
+    copy(external_passport,image/external_passport.name)
     link=image/'Applications'
     if not link.exists():link.symlink_to('/Applications')
     (image/'READ-ME.txt').write_text('Drag praxis-relay.app to Applications.\nmacOS 13.3+; Intel and Apple Silicon.\nAd-hoc signed; not Apple notarized. First opening may require approval in Privacy & Security.\nAccounts remain in ~/Library/Application Support/praxis-relay.\n',encoding='utf-8')
