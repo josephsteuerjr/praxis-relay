@@ -1,7 +1,7 @@
 name: macOS native ports
 on:
   push:
-    branches: ['codex/relay-unix-ports-2310']
+    branches: [main, 'codex/**']
     paths-ignore: ['packaging/**', '.github/workflows/macos*.yml']
   workflow_dispatch:
 permissions:
@@ -22,7 +22,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 55
     env:
-      CARGO_BUILD_JOBS: '2'
       MACOSX_DEPLOYMENT_TARGET: '13.3'
     steps:
       - uses: actions/checkout@v7
@@ -39,11 +38,11 @@ jobs:
       - name: Offline OAuth and Rust tests
         run: |
           python3 -m unittest discover -s tests -p test_login_helper.py -v
-          cargo test --locked -j 2 -- --test-threads=1
+          cargo test --locked
       - name: Build native executables
         run: |
-          cargo build --release --locked -j 2 --bin praxis-relay-headless
-          cargo build --manifest-path desktop/Cargo.toml --release --locked -j 2 --target-dir target
+          cargo build --release --locked --bin praxis-relay-headless
+          cargo build --manifest-path desktop/Cargo.toml --release --locked --target-dir target
       - name: Accept actual native headless binary
         run: |
           python3 tests/accept_headless.py target/release/praxis-relay-headless
@@ -94,11 +93,11 @@ jobs:
           codesign --verify --deep --strict dist/praxis-relay.app
           hdiutil verify dist/*.dmg
           python3 tests/accept_headless.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless
-          python3 tests/accept_desktop.py dist/praxis-relay.app/Contents/MacOS/praxis-relay-desktop dist/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out universal-evidence
+          python3 packaging/accept_mac.py dist/praxis-relay.app --out universal-evidence
           mkdir "$RUNNER_TEMP/relay-mounted"
           hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/relay-mounted" dist/*.dmg
           python3 tests/accept_unix.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless"
-          python3 tests/accept_desktop.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-desktop" "$RUNNER_TEMP/relay-mounted/praxis-relay.app/Contents/MacOS/praxis-relay-headless" --out mounted-evidence
+          python3 packaging/accept_mac.py "$RUNNER_TEMP/relay-mounted/praxis-relay.app" --out mounted-evidence
           hdiutil detach "$RUNNER_TEMP/relay-mounted"
       - uses: actions/upload-artifact@v7
         if: always()
@@ -108,6 +107,7 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/*.tar.gz
+            dist/MACOS-BUILD-PASSPORT.json
             universal-evidence
             mounted-evidence
           retention-days: 14

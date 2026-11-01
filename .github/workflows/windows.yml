@@ -12,8 +12,6 @@ jobs:
   product:
     runs-on: windows-latest
     timeout-minutes: 40
-    env:
-      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v7
       - name: Rust toolchain
@@ -28,9 +26,9 @@ jobs:
       - name: Offline OAuth callback tests
         run: python -m unittest discover -s tests -p test_login_helper.py -v
       - name: Shared Rust service tests
-        run: cargo test --locked -j 2 -- --test-threads=1
+        run: cargo test --locked
       - name: Build headless
-        run: cargo build --release --locked -j 2 --bin praxis-relay-headless
+        run: cargo build --release --locked --bin praxis-relay-headless
       - name: Accept actual headless process
         run: python tests/accept_headless.py target/release/praxis-relay-headless.exe
       - uses: actions/upload-artifact@v7
@@ -39,7 +37,7 @@ jobs:
           path: target/release/praxis-relay-headless.exe
           retention-days: 7
       - name: Build native Tauri app
-        run: cargo build --manifest-path desktop/Cargo.toml --release --locked -j 2 --target-dir target
+        run: cargo build --manifest-path desktop/Cargo.toml --release --locked --target-dir target
       - name: Package portable product
         run: python packaging/bundle.py windows --out package --binaries target/release
       - uses: actions/upload-artifact@v7

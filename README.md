@@ -1,5 +1,8 @@
 # Praxis Relay
 
+Version 1.1.1 restores compatibility with Ouroboros 7.9.0 cache-hinted requests.
+The desktop design and interface are unchanged.
+
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native
 **Tauri desktop app** and a separate **headless executable** share one Rust
 service for login, logout, quotas and account switching.
@@ -109,6 +112,11 @@ The listener always binds to loopback; do not share the key or data directory.
   false/absent, SSE with true; tool calls and vision. Omitted tool `strict` stays
   false, explicit schemas are preserved, successful completion closes the choice,
   and interrupted visible output is not silently replayed.
+  Optional `cache_control` metadata on content blocks and tool declarations is
+  accepted and ignored for compatible clients such as Ouroboros. These hints do
+  not enable Anthropic cache/TTL semantics on the Codex subscription route;
+  `prompt_cache_key` retains its existing behavior. Other content/tool fields
+  remain strictly validated.
 - `GET /v1/models`: backend-discovered catalog with bounded caching and fallback.
 - `GET /v1/limits`: active-account usage. Authoritative exhaustion may cause
   failover. Desktop per-account inspection is read-only and spends no model turn.
