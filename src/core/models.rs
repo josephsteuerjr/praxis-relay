@@ -235,13 +235,44 @@ pub enum MessageContent {
     Parts(Vec<MessageContentPart>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum MessageContentPart {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrlContent },
+}
+
+// Compatible clients may attach Anthropic-style cache metadata to content
+// blocks. Codex has no equivalent for those hints: consume this known field
+// without retaining or forwarding it. Keep all other fields strict and avoid
+// normalizing the whole request through Value (which would lose duplicate-field
+// errors in the surrounding typed request). The public/serialized model stays
+// unchanged, so existing renderers and callers have exactly the same contract.
+impl<'de> Deserialize<'de> for MessageContentPart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", deny_unknown_fields)]
+        enum Wire {
+            #[serde(rename = "text")]
+            Text {
+                text: String,
+                #[serde(rename = "cache_control")]
+                _cache_control: Option<serde::de::IgnoredAny>,
+            },
+            #[serde(rename = "image_url")]
+            ImageUrl {
+                image_url: ImageUrlContent,
+                #[serde(rename = "cache_control")]
+                _cache_control: Option<serde::de::IgnoredAny>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Text { text, .. } => Self::Text { text },
+            Wire::ImageUrl { image_url, .. } => Self::ImageUrl { image_url },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,7 +414,7 @@ fn validate_data_image_url(image_url: &str, max_decoded_bytes: usize) -> Result<
 
 /// Strict relay input union. Hosted search remains a Responses tool and must
 /// never be surfaced to clients as a function call they are expected to run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Tool {
     Function {
@@ -400,6 +431,34 @@ pub enum Tool {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search_context_size: Option<WebSearchContextSize>,
     },
+}
+
+// Accept the same optional metadata on tool declarations without walking into
+// function schemas or arguments, where cache_control can be a real property.
+impl<'de> Deserialize<'de> for Tool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Function {
+                function: Function,
+                #[serde(rename = "cache_control")]
+                _cache_control: Option<serde::de::IgnoredAny>,
+            },
+            WebSearch {
+                max_uses: Option<u32>,
+                external_web_access: Option<bool>,
+                search_context_size: Option<WebSearchContextSize>,
+                #[serde(rename = "cache_control")]
+                _cache_control: Option<serde::de::IgnoredAny>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Function { function, .. } => Self::Function { function },
+            Wire::WebSearch { max_uses, external_web_access, search_context_size, .. } =>
+                Self::WebSearch { max_uses, external_web_access, search_context_size },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

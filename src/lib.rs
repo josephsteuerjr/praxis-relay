@@ -14,6 +14,8 @@ use tracing::{error, info, warn};
 mod chat_response;
 #[cfg(test)]
 mod chat_response_tests;
+#[cfg(test)]
+mod cache_hint_tests;
 mod core;
 pub use core::config::auth_root;
 mod local_key;
