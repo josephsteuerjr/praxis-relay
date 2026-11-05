@@ -1,5 +1,5 @@
 """Verify rendered WKWebView content as well as the final bundle's native API."""
-import argparse,json,os,socket,subprocess,tempfile,time
+import argparse,json,os,secrets,socket,subprocess,tempfile,time
 from pathlib import Path
 
 parser=argparse.ArgumentParser()
@@ -45,8 +45,15 @@ with tempfile.TemporaryDirectory(prefix='relay-rendered-') as temporary:
    check(True,'light WKWebView renders its actual API address, confirmed by native OCR')
    duplicate=subprocess.run([str(desktop)],env=env,stdout=log,stderr=log,timeout=20)
    check(duplicate.returncode==0 and process.poll() is None,'second launch preserves the original native instance')
-   patch.write_text(json.dumps({'appearance':{'theme':'dark'},'labels':{'primary':'Rendered QA'}}));cli('configure',patch)
-   wait_for(lambda:rendered('native-dark.png','RenderedQA'))
+   # Vision can confuse Latin glyphs on the Intel runner. A fixture nonce stays unique.
+   marker = str(100000 + secrets.randbelow(900000))
+   label = 'QA ' + marker
+   (args.out/'fixture.json').write_text(
+       json.dumps({'port':port,'label':label,'ocr_marker':marker}), encoding='utf8')
+   patch.write_text(json.dumps({'appearance':{'theme':'dark'},'labels':{'primary':label}}))
+   cli('configure',patch)
+   check(cli('status')['settings']['labels']['primary']==label,'configured account label matches the OCR fixture nonce')
+   wait_for(lambda:rendered('native-dark.png',marker))
    check(True,'dark theme and changed account label reach the rendered WKWebView')
    run('osascript','-e',f'tell application id "{identifier}" to quit')
    check(process.wait(timeout=15)==0,'native Quit exits the final bundle cleanly')
@@ -54,6 +61,6 @@ with tempfile.TemporaryDirectory(prefix='relay-rendered-') as temporary:
    check((auth/'api-key.txt').read_text().strip()==key,'native Quit preserves the persistent client key')
   finally:
    if process.poll() is None:process.terminate();process.wait(timeout=15)
-proof=dict(passed=True,checks=checks)
+proof=dict(passed=True,checks=checks,fixture_label=label,ocr_marker=marker)
 (args.out/'native-acceptance.json').write_text(json.dumps(proof,indent=2)+'\n')
 print(json.dumps(proof,indent=2))
