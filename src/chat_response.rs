@@ -34,6 +34,7 @@ where
     let mut tools: BTreeMap<u64, Value> = BTreeMap::new();
     let mut finish = None;
     let mut usage = None;
+    let mut service_tier = None;
     let mut observation = None;
     let mut terminal = None;
     let mut failure = None;
@@ -51,6 +52,9 @@ where
         };
         id = Some(event.id.clone());
         created = Some(event.created);
+        if event.service_tier.is_some() {
+            service_tier = event.service_tier.clone();
+        }
         if event.usage.is_some() {
             usage = event.usage.clone();
         }
@@ -123,6 +127,9 @@ where
     });
     if let Some(value) = usage {
         document["usage"] = serde_json::to_value(value).expect("usage serializes");
+    }
+    if let Some(value) = service_tier {
+        document["service_tier"] = json!(value);
     }
     if let Some(value) = observation {
         document["relay_provider_observation"] = value;

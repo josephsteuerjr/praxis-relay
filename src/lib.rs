@@ -11,11 +11,11 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 // Modules
+#[cfg(test)]
+mod cache_hint_tests;
 mod chat_response;
 #[cfg(test)]
 mod chat_response_tests;
-#[cfg(test)]
-mod cache_hint_tests;
 mod core;
 pub use core::config::auth_root;
 mod local_key;
@@ -347,6 +347,19 @@ async fn chat_completions_handler(
                 .into_response());
         }
     };
+
+    if let Err(validation_error) = request.upstream_service_tier() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{
+                "message":validation_error.message,
+                "type":"invalid_request_error",
+                "param":"service_tier",
+                "code":"invalid_service_tier"
+            }})),
+        )
+            .into_response());
+    }
 
     info!("🚀 CHAT COMPLETIONS REQUEST RECEIVED!");
     info!("Request messages count: {}", request.messages.len());

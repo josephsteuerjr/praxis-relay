@@ -104,18 +104,18 @@ impl Config {
     /// RELAY_REASONING_EFFORT: none|minimal|low|medium|high|xhigh, applied when a
     /// request carries no reasoning_effort of its own.  "passthrough"/"default"/""
     /// omit the field entirely (upstream default, currently medium).  Env unset
-    /// keeps today's behavior: reasoning disabled ("none") on every call.
+    /// leaves reasoning depth to the model. Legacy "none" also uses that default.
     fn load_reasoning_effort() -> Option<String> {
         match std::env::var("RELAY_REASONING_EFFORT") {
             Ok(value) => {
                 let value = value.trim().to_lowercase();
-                if value.is_empty() || value == "passthrough" || value == "default" {
+                if value.is_empty() || value == "passthrough" || value == "default" || value == "none" {
                     None
                 } else {
                     Some(value)
                 }
             }
-            Err(_) => Some("none".to_string()),
+            Err(_) => None,
         }
     }
 
@@ -231,4 +231,23 @@ mod storage_tests {
         );
         assert!(default_auth_root(&exe, None, Some(Path::new("relative"))).is_err());
     }
+    #[test]
+    fn unset_and_legacy_none_environment_leave_reasoning_to_model() {
+        let _guard = crate::core::chat_completions::test_lever_guard();
+        let previous = std::env::var_os("RELAY_REASONING_EFFORT");
+        std::env::remove_var("RELAY_REASONING_EFFORT");
+        let fresh = Config::load_reasoning_effort();
+        std::env::set_var("RELAY_REASONING_EFFORT", "none");
+        let legacy = Config::load_reasoning_effort();
+        std::env::set_var("RELAY_REASONING_EFFORT", "high");
+        let selected = Config::load_reasoning_effort();
+        match previous {
+            Some(value) => std::env::set_var("RELAY_REASONING_EFFORT", value),
+            None => std::env::remove_var("RELAY_REASONING_EFFORT"),
+        }
+        assert_eq!(fresh, None);
+        assert_eq!(legacy, None);
+        assert_eq!(selected.as_deref(), Some("high"));
+    }
+
 }

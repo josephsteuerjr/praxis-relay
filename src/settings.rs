@@ -47,7 +47,7 @@ impl Default for Defaults {
     fn default() -> Self {
         Self {
             model: String::new(),
-            reasoning: "none".into(),
+            reasoning: "default".into(),
             instructions_mode: "codex".into(),
             instructions: String::new(),
             parallel_tools: true,
@@ -206,7 +206,8 @@ impl Settings {
             std::env::var("RELAY_DEFAULT_MODEL").unwrap_or_else(|_| self.defaults.model.clone());
         if std::env::var_os("RELAY_REASONING_EFFORT").is_none() {
             config.reasoning_effort =
-                (self.defaults.reasoning != "default").then(|| self.defaults.reasoning.clone());
+                (!matches!(self.defaults.reasoning.as_str(), "default" | "none"))
+                    .then(|| self.defaults.reasoning.clone());
         }
         if std::env::var_os("RELAY_INSTRUCTIONS").is_none() {
             config.instructions_mode = Some(self.defaults.instructions_mode.clone());
@@ -250,4 +251,28 @@ mod tests {
             .patched(serde_json::json!({"defaults":{"instructions":"\0"}}))
             .is_err());
     }
+    #[test]
+    fn fresh_and_legacy_none_use_model_default_without_rewriting_saved_settings() {
+        let _guard = crate::core::chat_completions::test_lever_guard();
+        let previous = std::env::var_os("RELAY_REASONING_EFFORT");
+        std::env::remove_var("RELAY_REASONING_EFFORT");
+        let root = tempfile::tempdir().unwrap();
+        let raw = br#"{"defaults":{"reasoning":"none"}}"#;
+        std::fs::write(root.path().join("settings.json"), raw).unwrap();
+        let legacy = Settings::load(root.path()).unwrap();
+        let base = Config {
+            codex_home: root.path().to_path_buf(), chatgpt_base_url: String::new(),
+            model: String::new(), user_instructions: None, reasoning_effort: Some("none".into()),
+            instructions_mode: None, parallel_tool_calls: true,
+        };
+        let fresh = Settings::default().config(&base);
+        let effective = legacy.config(&base);
+        if let Some(value) = previous { std::env::set_var("RELAY_REASONING_EFFORT", value); }
+        assert_eq!(Settings::default().defaults.reasoning, "default");
+        assert_eq!(fresh.reasoning_effort, None);
+        assert_eq!(legacy.defaults.reasoning, "none");
+        assert_eq!(effective.reasoning_effort, None);
+        assert_eq!(std::fs::read(root.path().join("settings.json")).unwrap(), raw);
+    }
+
 }

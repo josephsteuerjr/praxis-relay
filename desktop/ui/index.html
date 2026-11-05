@@ -380,19 +380,11 @@
             ><span id="model-source" class="muted"></span>
             <div class="setting-row">
               <label for="reasoning"
-                >Глубина рассуждений<small
-                  >Уровень ограничивается возможностями модели</small
+                >Глубина рассуждений<small id="reasoning-hint"
+                  >Доступные уровни определяет каталог выбранной модели</small
                 ></label
               ><select id="reasoning" data-setting="defaults.reasoning">
                 <option value="default">По умолчанию у модели</option>
-                <option value="none">Без рассуждений</option>
-                <option value="minimal">Минимальная</option>
-                <option value="low">Низкая</option>
-                <option value="medium">Средняя</option>
-                <option value="high">Высокая</option>
-                <option value="xhigh">Очень высокая</option>
-                <option value="max">Максимальная</option>
-                <option value="ultra">Ultra</option>
               </select>
             </div>
             <label class="check-row"
@@ -477,6 +469,6 @@ praxis-relay-headless.exe configure patch.json</pre
         </div>
       </section>
     </main>
-    <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>

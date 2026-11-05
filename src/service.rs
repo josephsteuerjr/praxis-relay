@@ -401,7 +401,8 @@ impl Relay {
                     .snapshot(&self.state.accounts, &self.state.client)
                     .await;
                 return Ok(
-                    json!({"source":snapshot.source.as_str(),"models":snapshot.listed_slugs()}),
+                    json!({"source":snapshot.source.as_str(),"models":snapshot.listed_slugs(),
+                        "data":crate::core::catalog::model_list_from(&snapshot).data}),
                 );
             }
             _ => bail!("Unknown command: {op}"),

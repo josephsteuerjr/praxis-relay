@@ -337,3 +337,283 @@ async fn json_error_keeps_legacy_diagnosis_and_typed_attempts_out_of_assistant_t
         }
     }
 }
+
+fn decoded_chat_events(wire: &str) -> Vec<Value> {
+    wire.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn fast_mode_forwards_requested_tier_and_reports_actual_json_and_sse() {
+    let _guard = chat_completions::test_lever_guard();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let received = seen.clone();
+    let upstream = Router::new().fallback(post(move |Json(payload): Json<Value>| {
+        let received = received.clone();
+        async move {
+            received.lock().unwrap().push(payload.clone());
+            let scenario = payload["input"][0]["content"].as_str().unwrap();
+            let (first, last) = match scenario {
+                "downgrade" => (Some("priority"), Some("default")),
+                "early_only" => (Some("priority"), None),
+                "terminal_only" => (None, Some("fast")),
+                "future_tier" => (Some("scale"), None),
+                "terminal_null" => (Some("priority"), None),
+                _ => (None, None),
+            };
+            let mut created = json!({"type":"response.created","response":{"model":"gpt-5.6-sol"}});
+            let mut terminal = completed(true);
+            if let Some(tier) = first {
+                created["response"]["service_tier"] = json!(tier);
+            }
+            if let Some(tier) = last {
+                terminal["response"]["service_tier"] = json!(tier);
+            }
+            if scenario == "terminal_null" {
+                terminal["response"]["service_tier"] = Value::Null;
+            }
+            (
+                [("content-type", "text/event-stream")],
+                sse(vec![created, message("Hello"), terminal]),
+            )
+        }
+    }));
+    let (upstream_url, upstream_task) = serve(upstream).await;
+    chat_completions::set_test_upstream_url(Some(format!("{upstream_url}/responses")));
+    let root = tempfile::tempdir().unwrap();
+    account(root.path());
+    let accounts = AccountRouter::load(root.path()).await.unwrap();
+    let (url, relay_task) = serve(app_router(state(root.path(), accounts))).await;
+    let client = reqwest::Client::new();
+    let requested = [
+        None,
+        Some(Value::Null),
+        Some(json!("fast")),
+        Some(json!("priority")),
+        Some(json!("default")),
+        Some(json!("auto")),
+        Some(json!("flex")),
+    ];
+    for path in ["/chat/completions", "/v1/chat/completions"] {
+        for streaming in [false, true] {
+            for tier in &requested {
+                for (scenario, first, last) in [
+                    ("downgrade", Some("priority"), Some("default")),
+                    ("early_only", Some("priority"), Some("priority")),
+                    ("terminal_only", None, Some("fast")),
+                    ("future_tier", Some("scale"), Some("scale")),
+                    ("terminal_null", Some("priority"), None),
+                    ("unknown", None, None),
+                ] {
+                    let effort = if tier.as_ref().and_then(Value::as_str) == Some("fast") { "ultra" } else { "high" };
+                    let mut body = json!({"model":"gpt-5.6-sol","stream":streaming,
+                        "reasoning_effort":effort,"prompt_cache_key":"tier-fixture",
+                        "messages":[{"role":"user","content":scenario}]});
+                    if let Some(tier) = tier {
+                        body["service_tier"] = tier.clone();
+                    }
+                    let response = client
+                        .post(format!("{url}{path}"))
+                        .json(&body)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    let wire = response.text().await.unwrap();
+                    let captured = seen.lock().unwrap().last().cloned().unwrap();
+                    let expected = tier.as_ref().and_then(Value::as_str).map(|tier| {
+                        if tier == "fast" {
+                            "priority"
+                        } else {
+                            tier
+                        }
+                    });
+                    assert_eq!(
+                        captured.get("service_tier").and_then(Value::as_str),
+                        expected
+                    );
+                    assert_eq!(captured["reasoning"]["effort"], effort);
+                    assert_eq!(captured["prompt_cache_key"], "tier-fixture");
+                    assert_eq!(captured["input"][0]["content"], scenario);
+                    if streaming {
+                        let events = decoded_chat_events(&wire);
+                        assert_eq!(
+                            events
+                                .first()
+                                .unwrap()
+                                .get("service_tier")
+                                .and_then(Value::as_str),
+                            first
+                        );
+                        assert_eq!(
+                            events
+                                .last()
+                                .unwrap()
+                                .get("service_tier")
+                                .and_then(Value::as_str),
+                            last
+                        );
+                        assert_eq!(
+                            events.last().unwrap()["choices"][0]["finish_reason"],
+                            "stop"
+                        );
+                        if scenario == "terminal_null" {
+                            assert_eq!(
+                                events.last().unwrap().get("service_tier"),
+                                Some(&Value::Null)
+                            );
+                        }
+                    } else {
+                        let output: Value = serde_json::from_str(&wire).unwrap();
+                        assert_eq!(output.get("service_tier").and_then(Value::as_str), last);
+                        assert_eq!(output["choices"][0]["message"]["content"], "Hello");
+                        if scenario == "terminal_null" {
+                            assert_eq!(output.get("service_tier"), Some(&Value::Null));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    relay_task.abort();
+    upstream_task.abort();
+    chat_completions::set_test_upstream_url(None);
+}
+
+#[tokio::test]
+async fn invalid_service_tier_is_http400_before_catalog_or_account_work() {
+    use tower::ServiceExt;
+    let root = tempfile::tempdir().unwrap();
+    let accounts = AccountRouter::open(root.path()).await.unwrap();
+    let app = app_router(state(root.path(), accounts));
+    for path in ["/chat/completions", "/v1/chat/completions"] {
+        for tier in [
+            json!(""),
+            json!("FAST"),
+            json!("premium"),
+            json!(" priority "),
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({"tier":"fast"}),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":"unknown-tier-model","messages":[],"service_tier":tier})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["param"], "service_tier");
+            assert_eq!(value["error"]["code"], "invalid_service_tier");
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn rejected_service_tier_is_not_retried_without_requested_knobs() {
+    let _guard = chat_completions::test_lever_guard();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let received = seen.clone();
+    let upstream = Router::new().fallback(post(move |Json(payload): Json<Value>| {
+        let parameter = payload["input"][0]["content"].as_str().unwrap().to_owned();
+        received.lock().unwrap().push(payload);
+        async move {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"type":"invalid_request_error",
+            "message":"Controlled parameter rejection", "param":parameter}})),
+            )
+        }
+    }));
+    let (upstream_url, upstream_task) = serve(upstream).await;
+    chat_completions::set_test_upstream_url(Some(format!("{upstream_url}/responses")));
+    let root = tempfile::tempdir().unwrap();
+    account(root.path());
+    let accounts = AccountRouter::load(root.path()).await.unwrap();
+    let (url, relay_task) = serve(app_router(state(root.path(), accounts))).await;
+    for parameter in ["service_tier", "prompt_cache_key"] {
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(
+                &json!({"model":"gpt-5.6-sol","service_tier":"fast","reasoning_effort":"high",
+                "messages":[{"role":"user","content":parameter}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        let output: Value = response.json().await.unwrap();
+        assert!(output.get("error").is_some());
+        assert!(output.get("service_tier").is_none());
+    }
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for payload in captured.iter() {
+        assert_eq!(payload["service_tier"], "priority");
+        assert_eq!(payload["reasoning"]["effort"], "high");
+    }
+    relay_task.abort();
+    upstream_task.abort();
+    chat_completions::set_test_upstream_url(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn failed_stream_keeps_actual_tier_without_replaying_receipted_attempt() {
+    let _guard = chat_completions::test_lever_guard();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let upstream=Router::new().fallback(post(move || {
+        counted.fetch_add(1,Ordering::SeqCst);
+        async { ([ ("content-type","text/event-stream") ],sse(vec![
+            json!({"type":"response.created","response":{"model":"gpt-5.6-sol","service_tier":"priority"}}),
+            json!({"type":"response.failed","response":{"service_tier":"default","error":{"message":"Controlled failure"}}}),
+        ])) }
+    }));
+    let (upstream_url, upstream_task) = serve(upstream).await;
+    chat_completions::set_test_upstream_url(Some(format!("{upstream_url}/responses")));
+    let root = tempfile::tempdir().unwrap();
+    account(root.path());
+    let accounts = AccountRouter::load(root.path()).await.unwrap();
+    let (url, relay_task) = serve(app_router(state(root.path(), accounts))).await;
+    for streaming in [false, true] {
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(
+                &json!({"model":"gpt-5.6-sol","stream":streaming,"service_tier":"fast",
+                "messages":[{"role":"user","content":"Hi"}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        let wire = response.text().await.unwrap();
+        if streaming {
+            let events = decoded_chat_events(&wire);
+            assert_eq!(events.first().unwrap()["service_tier"], "priority");
+            assert_eq!(events.last().unwrap()["service_tier"], "default");
+            assert!(events.last().unwrap().get("relay_terminal").is_some());
+        } else {
+            let output: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(output["service_tier"], "default");
+            assert!(output.get("error").is_some());
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    relay_task.abort();
+    upstream_task.abort();
+    chat_completions::set_test_upstream_url(None);
+}

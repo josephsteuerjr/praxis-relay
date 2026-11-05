@@ -1,3 +1,5 @@
+import { reasoningChoices } from "./reasoning-options.mjs";
+
 "use strict";
 const $ = (id) => document.getElementById(id);
 const escape = (s) =>
@@ -44,6 +46,7 @@ let state = null,
   identities = {},
   currentPage = "overview",
   lastQuotaRefresh = 0,
+  modelCatalog = [],
   toastTimer,
   saveQueue = Promise.resolve();
 const systemTheme = matchMedia("(prefers-color-scheme: dark)");
@@ -248,6 +251,43 @@ function renderAccounts() {
     .map((a) => accountCard(a, true))
     .join("");
 }
+const reasoningLabels = {
+  default: "По умолчанию у модели", minimal: "Минимальная", low: "Низкая",
+  medium: "Средняя", high: "Высокая", xhigh: "Очень высокая",
+  max: "Максимальная", ultra: "Ultra",
+};
+function syncReasoningChoices() {
+  if (!state) return;
+  const model = $("default-model").value.trim();
+  const choices = reasoningChoices(modelCatalog, model);
+  const saved = drafts.get("defaults.reasoning") ?? state.settings.defaults.reasoning;
+  const desired = saved === "none" ? "default" : saved;
+  const available = choices.includes(desired);
+  const options = (available ? "" : '<option value="" disabled>Выбери доступный уровень</option>') +
+    choices.map((value) => `<option value="${escape(value)}">${reasoningLabels[value]}</option>`).join("");
+  const select = $("reasoning");
+  if (select.dataset.choices !== options) {
+    select.innerHTML = options;
+    select.dataset.choices = options;
+  }
+  select.value = available ? desired : "";
+  $("reasoning-hint").textContent = saved === "none"
+    ? "Для ранее сохранённого режима используется глубина по умолчанию модели."
+    : !available
+      ? "Сохранённый уровень недоступен в каталоге выбранной модели. Выбери доступный уровень."
+      : choices.length === 1
+        ? "Доступные уровни появятся после загрузки каталога выбранной модели."
+        : "Доступны уровни из каталога выбранной модели.";
+}
+async function loadModelCatalog() {
+  const data = await invoke("models");
+  modelCatalog = Array.isArray(data.data) ? data.data : [];
+  $("model-list").innerHTML = data.models
+    .map((model) => `<option value="${escape(model)}"></option>`).join("");
+  $("model-source").textContent =
+    `${data.models.length} моделей · ${data.source === "live" ? "актуальный каталог" : data.source === "stale" ? "сохранённый каталог" : "резервный каталог"}`;
+  syncReasoningChoices();
+}
 function syncSettings() {
   const prefs = state.settings;
   appearance(prefs.appearance);
@@ -275,6 +315,7 @@ function syncSettings() {
         ["defaults.instructions_mode", "defaults.instructions"].includes(path)
       );
   }
+  syncReasoningChoices();
   $("environment-note").hidden = !overrides.length;
   $("environment-note").textContent =
     "Переменные запуска имеют приоритет: " +
@@ -291,6 +332,7 @@ function render(next) {
   const previousPending = state?.login?.pending;
   state = next;
   if (initial) {
+    void loadModelCatalog().catch(() => { modelCatalog = []; syncReasoningChoices(); });
     const startupError = state.events.find((e) =>
       e.message.startsWith("API startup failed: "),
     );
@@ -388,12 +430,7 @@ async function action(op, slot = null) {
       await invoke("stop");
       render(await invoke("start"));
     } else if (op === "models") {
-      const data = await invoke("models");
-      $("model-list").innerHTML = data.models
-        .map((model) => `<option value="${escape(model)}"></option>`)
-        .join("");
-      $("model-source").textContent =
-        `${data.models.length} моделей · ${data.source === "live" ? "актуальный каталог" : data.source === "stale" ? "сохранённый каталог" : "резервный каталог"}`;
+      await loadModelCatalog();
     } else render(await invoke(op, slot));
   } catch (error) {
     notice(String(error));
@@ -464,9 +501,13 @@ async function flushSettings() {
   }
   await saveQueue;
 }
-document.addEventListener("change", (event) => commitInput(event.target));
+document.addEventListener("change", (event) => {
+  if (event.target.dataset.setting === "defaults.model") syncReasoningChoices();
+  commitInput(event.target);
+});
 document.addEventListener("input", (event) => {
   const input = event.target;
+  if (input.dataset.setting === "defaults.model") syncReasoningChoices();
   if (
     !input.dataset.setting ||
     input.type === "checkbox" ||

@@ -31,7 +31,7 @@ use tracing::{info, warn};
 
 use crate::core::account_router::AccountRouter;
 use crate::core::chat_completions::{codex_cli_version, codex_user_agent, CODEX_ORIGINATOR};
-use crate::core::models::{Model, ModelList, FALLBACK_MODELS};
+use crate::core::models::{Model, ModelList, ServiceTier, FALLBACK_MODELS};
 
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 pub const RELAY_MODELS_TTL_ENV: &str = "RELAY_MODELS_TTL";
@@ -58,6 +58,8 @@ pub struct CatalogModel {
     pub max_context_window: Option<u64>,
     pub input_modalities: Vec<String>,
     pub reasoning_efforts: Vec<String>,
+    pub service_tiers: Option<Vec<ServiceTier>>,
+    pub additional_speed_tiers: Option<Vec<String>>,
     pub default_reasoning_effort: Option<String>,
     pub minimal_client_version: Option<String>,
     pub upgrade: Option<String>,
@@ -75,6 +77,8 @@ impl CatalogModel {
             max_context_window: None,
             input_modalities: Vec::new(),
             reasoning_efforts: Vec::new(),
+            service_tiers: None,
+            additional_speed_tiers: None,
             default_reasoning_effort: None,
             minimal_client_version: None,
             upgrade: None,
@@ -433,6 +437,35 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn tier_identifier(value: &Value) -> Option<String> {
+    value.as_str().filter(|value| {
+        !value.is_empty() && value.len() <= 64
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }).map(str::to_owned)
+}
+
+fn tier_description(value: Option<&Value>, limit: usize) -> Option<String> {
+    value.and_then(Value::as_str)
+        .map(|text| text.chars().filter(|ch| !ch.is_control()).take(limit).collect::<String>())
+        .filter(|text| !text.is_empty())
+}
+
+fn service_tiers(value: Option<&Value>) -> Option<Vec<ServiceTier>> {
+    let values = value?.as_array()?;
+    let tiers: Vec<_> = values.iter().filter_map(|tier| Some(ServiceTier {
+        id: tier_identifier(tier.get("id")?)?,
+        name: tier_description(tier.get("name"), 128),
+        description: tier_description(tier.get("description"), 2048),
+    })).collect();
+    (values.is_empty() || !tiers.is_empty()).then_some(tiers)
+}
+
+fn additional_speed_tiers(value: Option<&Value>) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    let tiers: Vec<_> = values.iter().filter_map(tier_identifier).collect();
+    (values.is_empty() || !tiers.is_empty()).then_some(tiers)
+}
+
 /// Reduce the backend document to [`CatalogModel`]s, sorted by the backend's
 /// own priority (ties keep document order). Entries without a slug are skipped;
 /// an answer with no usable entry is an error, not an empty catalog -- an empty
@@ -473,6 +506,8 @@ pub fn parse_catalog(raw: &Value) -> Result<Vec<CatalogModel>> {
             context_window: item.get("context_window").and_then(Value::as_u64),
             max_context_window: item.get("max_context_window").and_then(Value::as_u64),
             input_modalities: string_list(item.get("input_modalities")),
+            service_tiers: service_tiers(item.get("service_tiers")),
+            additional_speed_tiers: additional_speed_tiers(item.get("additional_speed_tiers")),
             reasoning_efforts: item
                 .get("supported_reasoning_levels")
                 .and_then(Value::as_array)
@@ -532,6 +567,8 @@ pub fn model_list_from(snapshot: &CatalogSnapshot) -> ModelList {
                     .map(|window| json!({ "n_ctx_train": window })),
                 input_modalities: m.input_modalities.clone(),
                 reasoning_efforts: m.reasoning_efforts.clone(),
+                service_tiers: m.service_tiers.clone(),
+                additional_speed_tiers: m.additional_speed_tiers.clone(),
                 default_reasoning_effort: m.default_reasoning_effort.clone(),
                 upgrade: m.upgrade.clone(),
             })
@@ -590,6 +627,32 @@ mod tests {
         );
         assert_eq!(models[3].upgrade.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(models[3].priority, 16);
+    }
+
+    #[test]
+    fn speed_capabilities_keep_advertised_missing_and_empty_distinct() {
+        let raw = json!({"models":[
+            {"slug":"fast-capable","service_tiers":[{"id":"priority","name":"Fast", "description":"Faster processing", "private_unknown":"drop"}], "additional_speed_tiers":["fast"]},
+            {"slug":"unsupported","service_tiers":[],"additional_speed_tiers":[]},
+            {"slug":"unknown"},
+            {"slug":"malformed","service_tiers":[{"id":"bad\nidentifier"}],"additional_speed_tiers":[false]},
+            {"slug":"sanitized","service_tiers":[{"id":"priority","name":"Fast\u{0}", "description":"Faster\u{1} processing"}]}
+        ]});
+        let snapshot = CatalogSnapshot { models: parse_catalog(&raw).unwrap(), source: CatalogSource::Live };
+        let document = serde_json::to_value(model_list_from(&snapshot)).unwrap();
+        let data = document["data"].as_array().unwrap();
+        assert_eq!(data[0]["service_tiers"],json!([{"id":"priority","name":"Fast","description":"Faster processing"}]));
+        assert_eq!(data[0]["additional_speed_tiers"],json!(["fast"]));
+        assert_eq!(data[1]["service_tiers"],json!([]));
+        assert_eq!(data[1]["additional_speed_tiers"],json!([]));
+        for index in [2,3] {
+            assert!(data[index].get("service_tiers").is_none());
+            assert!(data[index].get("additional_speed_tiers").is_none());
+        }
+        assert_eq!(data[4]["service_tiers"][0]["name"],"Fast");
+        assert_eq!(data[4]["service_tiers"][0]["description"],"Faster processing");
+        assert!(model_list_from(&CatalogSnapshot { models:fallback_models(),source:CatalogSource::Fallback }).data
+            .iter().all(|model| model.service_tiers.is_none() && model.additional_speed_tiers.is_none()));
     }
 
     #[test]

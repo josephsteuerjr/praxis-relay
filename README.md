@@ -1,7 +1,7 @@
 # Praxis Relay
 
-Version 1.1.1 restores compatibility with Ouroboros 7.9.0 cache-hinted requests.
-The desktop design and interface are unchanged.
+Version 1.1.2-rc.1 adds per-request Fast mode. It includes Ouroboros 7.9.0
+cache-hinted request support introduced in 1.1.1.
 
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native
 **Tauri desktop app** and a separate **headless executable** share one Rust
@@ -118,6 +118,10 @@ The listener always binds to loopback; do not share the key or data directory.
   `prompt_cache_key` retains its existing behavior. Other content/tool fields
   remain strictly validated.
 - `GET /v1/models`: backend-discovered catalog with bounded caching and fallback.
+  Optional `service_tiers` and `additional_speed_tiers` preserve the selected
+  model's advertised processing capabilities. Missing metadata is unknown;
+  explicit empty arrays advertise no additional tier. The desktop/headless
+  `models` control includes the same model documents in its `data` field.
 - `GET /v1/limits`: active-account usage. Authoritative exhaustion may cause
   failover. Desktop per-account inspection is read-only and spends no model turn.
 - `GET /v1/account`, `POST /v1/account/switch` with `{"slot":"secondary"}`:
@@ -126,6 +130,35 @@ The listener always binds to loopback; do not share the key or data directory.
   final image JSON through the same subscription, initially `gpt-image-2`.
   An interrupted image request is not automatically retried.
 - `GET /v1/images/models`, `GET /health`: capability metadata and liveness.
+
+### Fast mode
+
+Clients can opt in per request on either chat endpoint, in desktop or headless
+mode. Set `"service_tier":"fast"` or `"service_tier":"priority"`. The relay
+sends the canonical `priority` value to Codex Responses and keeps the requested
+reasoning effort and conversation input independent of the processing tier.
+
+```json
+{"model":"gpt-5.6-sol","service_tier":"fast","stream":true,
+ "messages":[{"role":"user","content":"Hello"}]}
+```
+
+The optional field also accepts `auto`, `default` and `flex`. Omission or `null`
+keeps the existing upstream default. Invalid values and JSON types return
+HTTP400 with `error.param` set to `service_tier`, before an upstream request.
+Account and model availability are determined by Codex. Explicit processing-tier
+requests retain their reasoning, cache and instruction parameters when rejected,
+without a conservative retry that changes those values.
+
+JSON responses and SSE chunks preserve the `service_tier` observed upstream.
+An early observation is carried into later chunks, and a terminal observation
+takes precedence. An explicit upstream null clears the earlier observation. A request for Fast mode may therefore return `default` if
+upstream selects standard processing. If upstream never reports the field, the relay
+also omits it. Fast mode can consume subscription allowance or credits at a
+higher rate. Check your account's applicable terms before enabling it.
+
+See [OpenAI Fast mode documentation](https://developers.openai.com/api/docs/guides/fast-mode)
+and [Codex speed configuration](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
 A listed model is not proof of account entitlement. Quota exhaustion may move
 new requests to a distinct configured account. Additional model quota buckets
@@ -162,6 +195,13 @@ Example patch (unspecified fields are preserved):
 A missing/blank chat model uses the saved model, or the first listed catalog
 model when no default was chosen. Explicit request values retain priority.
 Additional instructions accompany either built-in instruction mode.
+Fresh installations use the model's default reasoning depth. The desktop's
+reasoning choices follow the selected model's advertised `reasoning_efforts`.
+A missing catalog offers the model default until metadata is available.
+Legacy saved `none` remains readable and is applied as the model default, with
+an explanation in the desktop. Reading old settings leaves their file intact.
+Explicit API requests retain the existing catalog-validation compatibility.
+
 An existing nonempty `instructions.txt` / `RELAY_INSTRUCTIONS_FILE` remains a
 complete per-request override; the desktop explains this and disables the
 superseded instruction fields. No provider entitlement is inferred from a setting.

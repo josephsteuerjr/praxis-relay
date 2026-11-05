@@ -350,6 +350,7 @@ fn terminal_event_with_options(
             .as_secs() as i64,
         model: model.to_string(),
         usage: None,
+        service_tier: None,
         choices: vec![ResponseChoice {
             index: 0,
             delta: ResponseDelta {
@@ -669,6 +670,12 @@ fn build_responses_payload(
             payload["reasoning"] = json!({"effort": effort});
         }
     }
+    if let Some(tier) = request
+        .upstream_service_tier()
+        .expect("service tier validated before producer startup")
+    {
+        payload["service_tier"] = json!(tier);
+    }
     if let Some(key) = prompt_cache_key {
         payload["prompt_cache_key"] = json!(key);
     }
@@ -785,6 +792,7 @@ pub async fn stream_chat_completions(
     request: ChatRequest,
     client: Client,
 ) -> Result<CompletionReceiver> {
+    request.upstream_service_tier()?;
     let (tx, rx) = mpsc::channel(100);
     let cancellation = DownstreamCancellation::default();
     let receiver_cancellation = cancellation.clone();
@@ -1026,7 +1034,11 @@ pub async fn stream_chat_completions(
                         // Optional knobs (reasoning, prompt_cache_key, minimal instructions)
                         // may be rejected by an upstream quirk; retry once in the maximally
                         // conservative shape so the worst case equals the pre-knob relay.
-                        if matches!(status.as_u16(), 400 | 404 | 422) && !retried {
+                        if matches!(status.as_u16(), 400 | 404 | 422)
+                            && !retried
+                            && request.service_tier.is_none()
+                            && !service_tier_rejected(&response_body)
+                        {
                             retried = true;
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("reasoning");
@@ -1136,6 +1148,7 @@ pub async fn stream_chat_completions(
             // usage-shaped object in some other event must not bless a torn stream.
             let mut saw_completed = false;
             let mut meaningful_event_sent = false;
+            let mut actual_service_tier = None;
             let mut stream_failure: Option<String> = None;
             let mut events_seen: u64 = 0;
             let mut text_chars_sent: usize = 0;
@@ -1215,6 +1228,9 @@ pub async fn stream_chat_completions(
                                       "ignoring upstream event after response.completed");
                                     break 'read_stream;
                                 }
+                                if let Some(tier) = extract_service_tier(&event_json) {
+                                    actual_service_tier = Some(tier);
+                                }
                                 let failed_event = matches!(
                                     event_json.get("type").and_then(Value::as_str),
                                     Some("response.failed" | "response.error" | "error")
@@ -1233,6 +1249,7 @@ pub async fn stream_chat_completions(
                                 if let Some(mut response_event) =
                                     parse_sse_event(&event_json, tool_call_index)
                                 {
+                                    response_event.service_tier = actual_service_tier.clone();
                                     if response_event
                                         .choices
                                         .first()
@@ -1284,6 +1301,10 @@ pub async fn stream_chat_completions(
                                     }
                                     if should_send {
                                         let response_is_useful = response_event.usage.is_some()
+                                            || response_event
+                                                .service_tier
+                                                .as_ref()
+                                                .is_some_and(Value::is_string)
                                             || response_event.choices.iter().any(|choice| {
                                                 choice.finish_reason.is_some()
                                                     || choice
@@ -1355,18 +1376,24 @@ pub async fn stream_chat_completions(
                   last_event = %last_event_type, sent_chars = text_chars_sent,
                   meaningful_event_sent, reason = %reason,
                   "upstream SSE ended incompletely");
-                if !meaningful_event_sent && !stream_retry_done {
+                if !meaningful_event_sent
+                    && !stream_retry_done
+                    && actual_service_tier
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .is_none()
+                {
                     stream_retry_done = true;
                     warn!(slot = %account.slot,
                       "retrying incomplete upstream stream before downstream output");
                     continue 'upstream_attempt;
                 }
-                let _ = tx
-                    .send(Ok(stream_torn_event(
-                        &request.model,
-                        Terminal::new(TERMINAL_TORN, reason).on_slot(&account.slot),
-                    )))
-                    .await;
+                let mut terminal = stream_torn_event(
+                    &request.model,
+                    Terminal::new(TERMINAL_TORN, reason).on_slot(&account.slot),
+                );
+                terminal.service_tier = actual_service_tier;
+                let _ = tx.send(Ok(terminal)).await;
             }
             break 'upstream_attempt;
         }
@@ -1376,6 +1403,27 @@ pub async fn stream_chat_completions(
         inner: rx,
         cancellation: receiver_cancellation,
     })
+}
+
+fn extract_service_tier(event: &Value) -> Option<Value> {
+    event
+        .pointer("/response/service_tier")
+        .or_else(|| event.get("service_tier"))
+        .filter(|tier| tier.is_null() || tier.as_str().is_some_and(|tier| !tier.is_empty()))
+        .cloned()
+}
+
+fn service_tier_rejected(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/param")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|param| param == "service_tier")
+        || body.contains("service_tier")
 }
 
 fn parse_sse_event(event: &Value, tool_call_index: usize) -> Option<ResponseEvent> {
@@ -1434,10 +1482,12 @@ fn parse_sse_event(event: &Value, tool_call_index: usize) -> Option<ResponseEven
             .and_then(|response| response.get("model"))
             .and_then(Value::as_str)
             .unwrap_or("gpt-4");
-        return Some(terminal_event(
+        let mut terminal = terminal_event(
             model,
             Terminal::new(TERMINAL_TORN, upstream_failure_detail(event)),
-        ));
+        );
+        terminal.service_tier = extract_service_tier(event);
+        return Some(terminal);
     }
 
     // Streaming Responses API: a finished output item. A function_call item must be surfaced as an
@@ -1471,6 +1521,7 @@ fn parse_sse_event(event: &Value, tool_call_index: usize) -> Option<ResponseEven
                         .as_secs() as i64,
                     model: "gpt-4".to_string(),
                     usage: None,
+                    service_tier: extract_service_tier(event),
                     choices: vec![ResponseChoice {
                         index: 0,
                         delta: ResponseDelta {
@@ -1515,6 +1566,7 @@ fn parse_sse_event(event: &Value, tool_call_index: usize) -> Option<ResponseEven
                         .as_secs() as i64,
                     model,
                     usage: None,
+                    service_tier: extract_service_tier(event),
                     choices: vec![ResponseChoice {
                         index: 0,
                         delta: ResponseDelta {
@@ -1560,6 +1612,7 @@ fn parse_sse_event(event: &Value, tool_call_index: usize) -> Option<ResponseEven
     Some(ResponseEvent {
         relay_terminal: None,
         usage: extract_completed_usage(event),
+        service_tier: extract_service_tier(event),
         id: event
             .get("id")
             .and_then(|v| v.as_str())

@@ -77,9 +77,31 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    // Keep invalid JSON types until semantic validation so clients receive a
+    // field-specific HTTP400, rather than an extractor's generic shape error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
+    pub fn upstream_service_tier(&self) -> Result<Option<&str>, RequestValidationError> {
+        match self.service_tier.as_ref() {
+            None => Ok(None),
+            Some(serde_json::Value::String(value)) => match value.as_str() {
+                "fast" => Ok(Some("priority")),
+                "auto" | "default" | "flex" | "priority" => Ok(Some(value)),
+                _ => Err(RequestValidationError::new(
+                    "service_tier",
+                    "service_tier must be auto, default, flex, priority, or fast",
+                )),
+            },
+            Some(_) => Err(RequestValidationError::new(
+                "service_tier",
+                "service_tier must be a string or null",
+            )),
+        }
+    }
+
     /// Validate the semantic constraints that serde alone cannot express.
     ///
     /// JSON shape errors are rejected by Axum's `Json` extractor. This pass
@@ -455,8 +477,16 @@ impl<'de> Deserialize<'de> for Tool {
         }
         Ok(match Wire::deserialize(deserializer)? {
             Wire::Function { function, .. } => Self::Function { function },
-            Wire::WebSearch { max_uses, external_web_access, search_context_size, .. } =>
-                Self::WebSearch { max_uses, external_web_access, search_context_size },
+            Wire::WebSearch {
+                max_uses,
+                external_web_access,
+                search_context_size,
+                ..
+            } => Self::WebSearch {
+                max_uses,
+                external_web_access,
+                search_context_size,
+            },
         })
     }
 }
@@ -520,6 +550,15 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceTier {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -544,6 +583,11 @@ pub struct Model {
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
+    /// None is unknown; Some(empty) explicitly advertises no additional tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<Vec<ServiceTier>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_speed_tiers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
     /// The slug the backend suggests instead, when it marks this one superseded.
@@ -611,6 +655,9 @@ pub struct ResponseEvent {
     // meter is not blind (reasoning tokens are included in completion_tokens).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub usage: Option<Usage>,
+    /// The observed upstream processing tier, never the requested tier.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub service_tier: Option<serde_json::Value>,
     // Терминал — последним полем и со `skip_serializing_if`: пока его нет, байты чанка
     // совпадают с сегодняшними ровно, и выключенный рычаг ничего не меняет на проводе.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -698,6 +745,8 @@ mod tests {
             meta: None,
             input_modalities: Vec::new(),
             reasoning_efforts: Vec::new(),
+            service_tiers: None,
+            additional_speed_tiers: None,
             default_reasoning_effort: None,
             upgrade: None,
         };
