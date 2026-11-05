@@ -26,6 +26,10 @@ use crate::login::lib::{AuthMode, CodexAuth};
 const STATE_SCHEMA: &str = "relay.account-router.v1";
 pub const ACCOUNT_SLOTS: [&str; 2] = ["primary", "secondary"];
 const DEFAULT_COOLDOWN_SECONDS: u64 = 15 * 60;
+/// Bounds of every parking period: the configured cooldown and a vendor-named
+/// quota reset alike.
+const MIN_COOLDOWN_SECONDS: u64 = 60;
+const MAX_COOLDOWN_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AccountRouter {
@@ -177,6 +181,34 @@ pub struct SlotView {
     pub cooldown_seconds_left: i64,
 }
 
+/// When the vendor says an exhausted subscription opens again, in its own words.
+///
+/// A quota answer may name either field, both or neither. The default names
+/// nothing, and the slot is then parked for the configured cooldown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuotaReset {
+    /// Unix seconds.
+    pub resets_at: Option<i64>,
+    pub resets_in_seconds: Option<i64>,
+}
+
+impl QuotaReset {
+    /// Seconds from `now` until the named reset, or `None` when nothing usable
+    /// was named: zero, negative and past values name no reset. The relative
+    /// value wins because the vendor measured it at the moment of its answer,
+    /// so clock skew between the vendor and this machine cannot move it.
+    pub(crate) fn seconds_after(&self, now: i64) -> Option<u64> {
+        self.resets_in_seconds
+            .filter(|seconds| *seconds > 0)
+            .or_else(|| {
+                self.resets_at
+                    .map(|at| at.saturating_sub(now))
+                    .filter(|seconds| *seconds > 0)
+            })
+            .and_then(|seconds| u64::try_from(seconds).ok())
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct PersistentState {
     schema: String,
@@ -250,7 +282,7 @@ impl AccountRouter {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_COOLDOWN_SECONDS)
-            .clamp(60, 7 * 24 * 60 * 60);
+            .clamp(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS);
         let router = Self {
             accounts: Arc::new(accounts),
             state: Arc::new(Mutex::new(state.clone())),
@@ -376,22 +408,34 @@ impl AccountRouter {
     /// Atomically marks `exhausted` unavailable for a bounded cooldown and
     /// makes the other valid account the global active slot.  Concurrent
     /// requests that saw the same exhaustion converge on the first switch.
-    pub async fn switch_after_quota(&self, exhausted: &AccountLease) -> Result<AccountLease> {
-        self.switch_after_quota_guarded(exhausted, None).await
+    ///
+    /// The cooldown lasts until `reset`, the vendor's own word on when the
+    /// subscription opens again, kept within the bounds of the configured
+    /// cooldown (60 seconds to 7 days).  When no usable reset was named, the
+    /// configured cooldown applies as before.
+    pub async fn switch_after_quota(
+        &self,
+        exhausted: &AccountLease,
+        reset: QuotaReset,
+    ) -> Result<AccountLease> {
+        self.switch_after_quota_guarded(exhausted, reset, None)
+            .await
     }
 
     pub(crate) async fn switch_after_quota_for_downstream(
         &self,
         exhausted: &AccountLease,
+        reset: QuotaReset,
         cancellation: &DownstreamCancellation,
     ) -> Result<AccountLease> {
-        self.switch_after_quota_guarded(exhausted, Some(cancellation))
+        self.switch_after_quota_guarded(exhausted, reset, Some(cancellation))
             .await
     }
 
     async fn switch_after_quota_guarded(
         &self,
         exhausted: &AccountLease,
+        reset: QuotaReset,
         cancellation: Option<&DownstreamCancellation>,
     ) -> Result<AccountLease> {
         let now = Utc::now().timestamp();
@@ -439,15 +483,22 @@ impl AccountRouter {
         }
         #[cfg(test)]
         self.stop_at_commit_gate();
+        let (parked_for, parked_by) = match reset.seconds_after(now) {
+            Some(seconds) => (
+                seconds.clamp(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
+                "vendor reset",
+            ),
+            None => (self.cooldown.as_secs(), "configured cooldown"),
+        };
         let mut next = state.clone();
         next.active = standby.slot.clone();
         next.exhausted_until
-            .insert(exhausted.slot.clone(), now + self.cooldown.as_secs() as i64);
+            .insert(exhausted.slot.clone(), now + parked_for as i64);
         self.persist(&next)?;
         *state = next;
         info!(
-            "subscription quota exhausted: switched active slot {} -> {}",
-            exhausted.slot, standby.slot
+            "subscription quota exhausted: switched active slot {} -> {}; {} parked for {}s ({})",
+            exhausted.slot, standby.slot, exhausted.slot, parked_for, parked_by
         );
         Ok(standby)
     }
@@ -483,9 +534,10 @@ impl AccountRouter {
     /// The standby is validated and refreshed BEFORE global state moves, exactly
     /// as on the quota path, so a broken profile cannot take the live one down.
     ///
-    /// A deliberate switch also clears that slot's cooldown: the timer was our
-    /// guess about when the subscription might be usable again, and an explicit
-    /// decision outranks a guess.  Genuine exhaustion re-arms it on the next 429.
+    /// A deliberate switch also clears that slot's cooldown: the timer was an
+    /// estimate of when the subscription might be usable again (the vendor's
+    /// reset or the configured cooldown), and an explicit decision outranks an
+    /// estimate.  Genuine exhaustion re-arms it on the next 429.
     pub async fn switch_to(&self, slot: &str) -> Result<AccountLease> {
         let wanted = slot.trim();
         if !self
@@ -493,15 +545,21 @@ impl AccountRouter {
             .iter()
             .any(|account| account.slot == wanted && account.configured())
         {
-            let configured: Vec<&str> = self
+            let configured = self
                 .accounts
                 .iter()
+                .filter(|account| account.configured())
                 .map(|account| account.slot.as_str())
-                .collect();
+                .collect::<Vec<_>>()
+                .join(", ");
             bail!(
                 "account slot {:?} is not configured (configured: {})",
                 wanted,
-                configured.join(", ")
+                if configured.is_empty() {
+                    "none"
+                } else {
+                    configured.as_str()
+                }
             );
         }
         let target = self
@@ -647,6 +705,13 @@ impl AccountRouter {
             .lease_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    /// What a quota park falls back to when the vendor named no usable reset;
+    /// tests compare against it so `RELAY_ACCOUNT_COOLDOWN_SECONDS` cannot skew them.
+    #[cfg(test)]
+    pub(crate) fn configured_cooldown_seconds(&self) -> i64 {
+        self.cooldown.as_secs() as i64
     }
 
     #[cfg(test)]
@@ -798,7 +863,10 @@ mod tests {
         write_account(root.path(), "secondary", "acct-secondary");
         let router = AccountRouter::load(root.path()).await.unwrap();
         let exhausted = router.lease_active().await.unwrap();
-        let standby = router.switch_after_quota(&exhausted).await.unwrap();
+        let standby = router
+            .switch_after_quota(&exhausted, QuotaReset::default())
+            .await
+            .unwrap();
         assert_eq!(standby.slot, "secondary");
         assert_eq!(router.lease_active().await.unwrap().slot, "secondary");
 
@@ -838,12 +906,18 @@ mod tests {
         let root = tempdir().unwrap();
         write_account(root.path(), "primary", "acct-primary");
         let router = AccountRouter::load(root.path()).await.unwrap();
-        let error = match router.switch_to("tertiary").await {
-            Ok(_) => panic!("an unconfigured slot was accepted"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("not configured"), "{error}");
-        assert!(error.contains("primary"), "{error}");
+        // The list names only slots that can actually be selected: the known but
+        // logged-out secondary is no more selectable than an unknown name.
+        for wanted in ["tertiary", "secondary"] {
+            let error = match router.switch_to(wanted).await {
+                Ok(_) => panic!("an unconfigured slot was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert_eq!(
+                error,
+                format!("account slot {wanted:?} is not configured (configured: primary)")
+            );
+        }
     }
 
     #[tokio::test]
@@ -853,7 +927,10 @@ mod tests {
         write_account(root.path(), "secondary", "acct-secondary");
         let router = AccountRouter::load(root.path()).await.unwrap();
         let exhausted = router.lease_active().await.unwrap();
-        router.switch_after_quota(&exhausted).await.unwrap();
+        router
+            .switch_after_quota(&exhausted, QuotaReset::default())
+            .await
+            .unwrap();
         assert_eq!(router.active_slot().await, "secondary");
         assert!(
             router
@@ -988,7 +1065,7 @@ mod tests {
         // future. The guarded router operation itself must reject its commit.
         cancellation.cancel();
         let error = match router
-            .switch_after_quota_for_downstream(&exhausted, &cancellation)
+            .switch_after_quota_for_downstream(&exhausted, QuotaReset::default(), &cancellation)
             .await
         {
             Ok(_) => panic!("a commit was allowed after cancellation completed"),
@@ -1028,10 +1105,11 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(
-                router_for_commit
-                    .switch_after_quota_for_downstream(&exhausted, &cancellation_for_commit),
-            )
+            runtime.block_on(router_for_commit.switch_after_quota_for_downstream(
+                &exhausted,
+                QuotaReset::default(),
+                &cancellation_for_commit,
+            ))
         });
         commit_reached
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -1101,7 +1179,10 @@ mod tests {
         write_account(root.path(), "secondary", "same-account");
         let router = AccountRouter::load(root.path()).await.unwrap();
         let exhausted = router.lease_active().await.unwrap();
-        let error = match router.switch_after_quota(&exhausted).await {
+        let error = match router
+            .switch_after_quota(&exhausted, QuotaReset::default())
+            .await
+        {
             Ok(_) => panic!("duplicate subscription was accepted"),
             Err(error) => error,
         };
