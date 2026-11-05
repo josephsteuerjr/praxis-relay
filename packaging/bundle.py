@@ -163,8 +163,10 @@ def mac(args):
     headless(contents/'MacOS/praxis-relay-headless',out,'macos-universal',args.commit)
 
 def windows(args):
+    from windows_pe import require_portable_runtime
     out=args.out;out.mkdir(parents=True,exist_ok=True)
     for name in ('praxis-relay-desktop.exe','praxis-relay-headless.exe'):
+        require_portable_runtime(args.binaries/name)
         copy(args.binaries/name,out/name,True)
     docs(out);passport(out,'x86_64-pc-windows-msvc',args.commit)
 

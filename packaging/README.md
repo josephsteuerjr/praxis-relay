@@ -32,6 +32,12 @@ next-to-executable instruction-file behavior.
 
 ## Runtime dependencies
 
+Windows 10/11 x64 release builds carry the VC runtime code they need. Neither
+executable requires a separate Visual C++ redistributable installation. The
+desktop uses the Universal CRT included with Windows and requires the Microsoft
+Edge WebView2 runtime. Packaging checks normal and delay-loaded DLL imports.
+The system UCRT is documented by [Microsoft](https://learn.microsoft.com/en-us/cpp/windows/universal-crt-deployment).
+
 The desktop uses system WebKit: WKWebView on macOS and WebKitGTK 4.1 on Linux.
 DEB/RPM dependency metadata installs the GTK/WebKit/AppIndicator runtime.
 Python 3.10+ with SSL is needed only for browser sign-in, not serving requests.

@@ -1,6 +1,6 @@
 # Praxis Relay
 
-Version 1.1.2-rc.1 adds per-request Fast mode. It includes Ouroboros 7.9.0
+Version 1.1.2 adds per-request Fast mode. It includes Ouroboros 7.9.0
 cache-hinted request support introduced in 1.1.1.
 
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native

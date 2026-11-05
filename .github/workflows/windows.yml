@@ -23,10 +23,10 @@ jobs:
             target
           key: windows-relay-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: windows-relay-
-      - name: Offline OAuth callback tests
-        run: python -m unittest discover -s tests -p test_login_helper.py -v
+      - name: Offline OAuth and portable PE tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Shared Rust service tests
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
       - name: Build headless
         run: cargo build --release --locked --bin praxis-relay-headless
       - name: Accept actual headless process

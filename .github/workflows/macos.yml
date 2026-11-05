@@ -37,7 +37,7 @@ jobs:
           restore-keys: relay-macos-${{ matrix.arch }}-
       - name: Offline OAuth and Rust tests
         run: |
-          python3 -m unittest discover -s tests -p test_login_helper.py -v
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           cargo test --locked
       - name: Build native executables
         run: |

@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# Portable executables carry their C runtime instead of requiring a VC installer.
+rustflags = ["-C", "target-feature=+crt-static"]
