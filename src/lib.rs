@@ -1385,6 +1385,73 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn replacing_an_account_cannot_park_it_using_the_previous_accounts_cached_limits() {
+        use crate::core::catalog::test_support::staged_login;
+
+        let _lever = chat_completions::test_lever_guard();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        let upstream = Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let account = headers["chatgpt-account-id"].to_str().unwrap().to_string();
+                recorded.lock().unwrap().push(account.clone());
+                let exhausted = account == "acct-primary";
+                Json(json!({"rate_limit": {
+                    "allowed": !exhausted,
+                    "limit_reached": exhausted,
+                    "primary_window": {
+                        "used_percent": if exhausted {100} else {0},
+                        "reset_after_seconds": 7200
+                    }
+                }}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        crate::core::limits::set_test_usage_url(Some(format!("http://{address}/usage")));
+        let root = tempdir().unwrap();
+        write_test_account(root.path(), "primary", "acct-primary");
+        write_test_account(root.path(), "secondary", "acct-secondary");
+        let accounts = AccountRouter::load(root.path()).await.unwrap();
+        let limits = LimitsCache::default();
+        let old = accounts.lease_active().await.unwrap();
+        assert!(crate::core::limits::subscription_exhausted(
+            &limits.get_for_account(&old).await.unwrap()
+        ));
+        let state = AppState {
+            api_key: None,
+            config: Arc::new(Config {
+                codex_home: root.path().to_path_buf(),
+                chatgpt_base_url: String::new(),
+                model: String::new(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: None,
+                parallel_tool_calls: false,
+            }),
+            accounts: accounts.clone(),
+            limits,
+            catalog: ModelCatalog::static_only(),
+            client: reqwest::Client::new(),
+        };
+        state.accounts.stage_next_login(staged_login("primary", "acct-replacement"));
+        state.login_account("primary").await.unwrap();
+
+        let app = app_router(state);
+        let response = get_json(&app, "/v1/limits").await;
+        assert_eq!(response["relay_account"]["active_slot"], "primary");
+        assert_eq!(response["rate_limit"]["limit_reached"], false);
+        assert_eq!(cooldown_left(&accounts, "primary").await, 0);
+        assert_eq!(get_json(&app, "/v1/limits").await, response);
+        assert_eq!(*seen.lock().unwrap(), ["acct-primary", "acct-replacement"]);
+        crate::core::limits::set_test_usage_url(None);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn http_switch_refusal_names_only_configured_slots() {
         for (configured, listed) in [(&["primary"][..], "primary"), (&[][..], "none")] {
             let root = tempdir().unwrap();

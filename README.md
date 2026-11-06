@@ -4,6 +4,7 @@ Version 1.1.3 binds model discovery to the account that fetched it and uses
 vendor quota reset windows when parking exhausted subscriptions. It includes
 per-request Fast mode from 1.1.2 and Ouroboros 7.9.0 cache-hinted request support
 introduced in 1.1.1.
+Cached usage limits follow the authenticated subscription identity across slot replacement.
 
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native
 **Tauri desktop app** and a separate **headless executable** share one Rust

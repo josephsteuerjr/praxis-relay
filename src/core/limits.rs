@@ -52,6 +52,7 @@ pub struct LimitsCache {
 }
 
 struct CachedLimits {
+    account_id: String,
     fetched: Instant,
     value: Value,
 }
@@ -98,7 +99,7 @@ impl LimitsCache {
         // status-page burst from fanning out into several upstream requests.
         let mut guard = self.inner.lock().await;
         if let Some(cached) = guard.get(&account.slot) {
-            if cached.fetched.elapsed() < CACHE_TTL {
+            if cached.account_id == account.account_id && cached.fetched.elapsed() < CACHE_TTL {
                 return Ok(cached.value.clone());
             }
         }
@@ -107,6 +108,7 @@ impl LimitsCache {
         guard.insert(
             account.slot.clone(),
             CachedLimits {
+                account_id: account.account_id.clone(),
                 fetched: Instant::now(),
                 value: value.clone(),
             },
