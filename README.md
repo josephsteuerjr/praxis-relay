@@ -1,7 +1,9 @@
 # Praxis Relay
 
-Version 1.1.2 adds per-request Fast mode. It includes Ouroboros 7.9.0
-cache-hinted request support introduced in 1.1.1.
+Version 1.1.3 binds model discovery to the account that fetched it and uses
+vendor quota reset windows when parking exhausted subscriptions. It includes
+per-request Fast mode from 1.1.2 and Ouroboros 7.9.0 cache-hinted request support
+introduced in 1.1.1.
 
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native
 **Tauri desktop app** and a separate **headless executable** share one Rust
@@ -91,8 +93,10 @@ from `~/.codex` or `~/.opencode`.
 
 Both legacy `local_auth/auth.json` and existing
 `local_auth/accounts/primary/auth.json` layouts are supported. The second slot is
-`local_auth/accounts/secondary/auth.json`. A failed or cancelled sign-in preserves
-the previous account; a successful, validated sign-in replaces it atomically.
+`local_auth/accounts/secondary/auth.json`. Before replacement credentials are installed,
+a failed or cancelled sign-in preserves the previous account. Once validated
+replacement credentials are installed, later cancellation or persistence failure
+does not roll them back; a successful sign-in replaces them atomically.
 Logout removes the selected relay slot. Existing requests may finish their leased
 turn; new requests re-read current credentials. It does not remotely revoke an
 upstream session or sign out another application.
@@ -122,6 +126,14 @@ The listener always binds to loopback; do not share the key or data directory.
   model's advertised processing capabilities. Missing metadata is unknown;
   explicit empty arrays advertise no additional tier. The desktop/headless
   `models` control includes the same model documents in its `data` field.
+  Its `relay_catalog` object, like `model_catalog` in `/health`, names the
+  source (`live`, `stale`, `fallback` or `static`) and the account `slot` whose
+  credentials fetched the list (`null` for the built-in list). A deliberate
+  switch to another slot refreshes the catalog on the next read; until that
+  succeeds, the previous slot's list keeps serving as `stale`. Signing a slot
+  out, or in again, discards the list its old credentials fetched: the next
+  read refreshes at once, and until that succeeds the built-in list serves as
+  `fallback`.
 - `GET /v1/limits`: active-account usage. Authoritative exhaustion may cause
   failover. Desktop per-account inspection is read-only and spends no model turn.
 - `GET /v1/account`, `POST /v1/account/switch` with `{"slot":"secondary"}`:

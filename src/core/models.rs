@@ -599,6 +599,22 @@ pub struct Model {
 pub struct ModelList {
     pub object: String,
     pub data: Vec<Model>,
+    /// Relay-only provenance beside the two OpenAI fields, in the spirit of
+    /// `relay_account` on `/v1/limits`: which source the list is served from
+    /// and which account slot's credentials fetched it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_catalog: Option<CatalogProvenance>,
+}
+
+/// Where a served model list came from (see `core::catalog`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProvenance {
+    /// `live`, `stale`, `fallback` or `static`.
+    pub source: String,
+    /// The account slot whose lease fetched the backend answer being served --
+    /// after a failover that is the standby, not the slot active when the fetch
+    /// began. `null` for the built-in list, which no subscription produced.
+    pub slot: Option<String>,
 }
 
 /// Машинное имя того, ЧЕМ кончился ход, — рядом с чанком, а не вместо него.
@@ -768,6 +784,12 @@ mod tests {
         .unwrap();
         assert_eq!(list.data[0].id, "gpt-5.5");
         assert!(list.data[0].input_modalities.is_empty());
+        assert!(list.relay_catalog.is_none());
+        let value = serde_json::to_value(&list).unwrap();
+        assert!(
+            value.get("relay_catalog").is_none(),
+            "a list without provenance keeps the plain two-field shape"
+        );
     }
 
     #[test]

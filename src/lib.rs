@@ -23,7 +23,7 @@ mod login;
 pub mod service;
 pub mod settings;
 
-use core::account_router::AccountRouter;
+use core::account_router::{AccountLease, AccountRouter};
 use core::catalog::ModelCatalog;
 use core::chat_completions;
 use core::config::Config;
@@ -44,6 +44,53 @@ struct AppState {
     // One pooled client for every upstream call: Client::new() per request cost a
     // fresh DNS+TCP+TLS handshake to chatgpt.com on every single LLM call.
     client: reqwest::Client,
+}
+
+impl AppState {
+    /// A deliberate account switch: the one door both `POST /v1/account/switch`
+    /// and the shared desktop/headless `switch` control go through. The router
+    /// validates the target and moves; the model catalog hears where it moved
+    /// from inside that commit, under the router's state lock, and stops
+    /// presenting an answer fetched through another slot as the live one.
+    /// Told only once the router returned, it could hear two overlapping
+    /// switches out of order -- the earlier one last -- and stay on the slot
+    /// that lost.
+    async fn switch_account(&self, slot: &str) -> anyhow::Result<AccountLease> {
+        self.accounts
+            .switch_to(slot, |selected| {
+                self.catalog.invalidate_for_switch(selected)
+            })
+            .await
+    }
+
+    /// Sign `slot` out: the door the shared desktop/headless `logout` control
+    /// goes through. The router removes the credentials -- and, when `slot` was
+    /// active, moves to the other configured slot; the model catalog forgets
+    /// the answer they fetched, so neither `/health` nor `/v1/models` goes on
+    /// presenting a removed subscription's list. It forgets it the moment the
+    /// router reports the credentials gone -- as the first file goes, not once
+    /// the call returns -- so neither a legacy cleanup or state write that
+    /// fails after that, nor a cancellation, keeps that list live.
+    async fn logout_account(&self, slot: &str) -> anyhow::Result<()> {
+        self.accounts
+            .logout(slot, || self.catalog.invalidate_for_credential_change(slot))
+            .await?;
+        Ok(())
+    }
+
+    /// Sign in to `slot`, replacing whatever account it held: the door the
+    /// shared `login` control goes through. The moment the router reports the
+    /// new credentials installed -- even if its state write then fails, or
+    /// the sign-in is cancelled -- the catalog forgets the answer the old ones
+    /// fetched, and the next read asks at once, past the retry cooldown a cold
+    /// start with no subscription to ask arms moments before the first
+    /// sign-in. A sign-in that ends before the install, in OAuth say, has
+    /// replaced nothing and invalidates nothing.
+    async fn login_account(&self, slot: &str) -> anyhow::Result<()> {
+        self.accounts
+            .login(slot, || self.catalog.invalidate_for_credential_change(slot))
+            .await
+    }
 }
 
 pub async fn cli_main() -> anyhow::Result<()> {
@@ -195,12 +242,14 @@ async fn account_switch_handler(
         }
     };
     let previous = state.accounts.active_slot().await;
-    match state.accounts.switch_to(&requested).await {
+    match state.switch_account(&requested).await {
         Ok(lease) => {
             info!("account switch requested: {} -> {}", previous, lease.slot);
-            // No cache to clear: LimitsCache is keyed by account, and `get`
+            // LimitsCache needs nothing: it is keyed by account, and `get`
             // leases the active slot first — so "how much is left?" already
-            // answers about the subscription that is now live.
+            // answers about the subscription that is now live. The model
+            // catalog holds one answer bound to the slot that fetched it;
+            // switch_account has invalidated it unless that slot is this one.
             Json(serde_json::json!({
                 "previous_slot": previous,
                 "active_slot": lease.slot,
@@ -661,6 +710,180 @@ mod tests {
             .is_client_error());
         assert_eq!(seen.lock().unwrap().len(), 3);
         task.abort();
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> serde_json::Value {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn models_and_health_name_the_fetching_slot_and_an_http_switch_refreshes_it() {
+        use crate::core::catalog::test_support::{model_for, CatalogFixture};
+        let backend = CatalogFixture::start().await;
+        let root = tempdir().unwrap();
+        write_test_account(root.path(), "primary", "acct-primary");
+        write_test_account(root.path(), "secondary", "acct-secondary");
+        let app = app_router(AppState {
+            api_key: None,
+            config: Arc::new(Config {
+                codex_home: root.path().into(),
+                chatgpt_base_url: String::new(),
+                model: String::new(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: None,
+                parallel_tool_calls: false,
+            }),
+            accounts: AccountRouter::load(root.path()).await.unwrap(),
+            limits: LimitsCache::default(),
+            catalog: backend.catalog(),
+            client: reqwest::Client::new(),
+        });
+
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "primary"})
+        );
+        assert_eq!(models["data"][0]["id"], model_for("acct-primary"));
+        assert_eq!(models["data"][0]["service_tiers"][0]["id"], "priority");
+        assert_eq!(models["data"][0]["additional_speed_tiers"], json!(["fast"]));
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["model_catalog"]["source"], "live");
+        assert_eq!(health["model_catalog"]["slot"], "primary");
+
+        let switch = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/account/switch")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"slot": "secondary"}).to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(switch).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // The very next read, well inside the TTL, is the secondary's answer.
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "secondary"})
+        );
+        assert_eq!(models["data"].as_array().unwrap().len(), 1);
+        assert_eq!(models["data"][0]["id"], model_for("acct-secondary"));
+        assert_eq!(models["data"][0]["service_tiers"], json!([]));
+        assert_eq!(models["data"][0]["additional_speed_tiers"], json!([]));
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["account_router"]["active_slot"], "secondary");
+        assert_eq!(health["model_catalog"]["source"], "live");
+        assert_eq!(health["model_catalog"]["slot"], "secondary");
+        assert_eq!(backend.hits("acct-primary"), 1);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+    }
+
+    async fn post_switch(app: Router, slot: &str) -> StatusCode {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/account/switch")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "slot": slot }).to_string()))
+            .unwrap();
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    /// Two deliberate switches overlap. The one that commits first is held
+    /// once committed -- the router's state lock released, its lease not yet
+    /// handed back, where `switch_account` used to tell the catalog -- while
+    /// the other commits and completes. In either order, the catalog follows
+    /// the slot left active: `/health` never calls the losing slot's answer
+    /// live, and `/v1/models` serves the active slot's own list.
+    #[tokio::test]
+    async fn overlapping_switches_leave_the_catalog_on_the_slot_left_active() {
+        use crate::core::account_router::TestGate;
+        use crate::core::catalog::test_support::{model_for, CatalogFixture};
+        for (first, last) in [("primary", "secondary"), ("secondary", "primary")] {
+            let backend = CatalogFixture::start().await;
+            let root = tempdir().unwrap();
+            write_test_account(root.path(), "primary", "acct-primary");
+            write_test_account(root.path(), "secondary", "acct-secondary");
+            let accounts = AccountRouter::load(root.path()).await.unwrap();
+            let app = app_router(AppState {
+                api_key: None,
+                config: Arc::new(Config {
+                    codex_home: root.path().into(),
+                    chatgpt_base_url: String::new(),
+                    model: String::new(),
+                    user_instructions: None,
+                    reasoning_effort: None,
+                    instructions_mode: None,
+                    parallel_tool_calls: false,
+                }),
+                accounts: accounts.clone(),
+                limits: LimitsCache::default(),
+                catalog: backend.catalog(),
+                client: reqwest::Client::new(),
+            });
+            let models = get_json(&app, "/v1/models").await;
+            assert_eq!(
+                models["relay_catalog"],
+                json!({"source": "live", "slot": "primary"})
+            );
+
+            let handback = TestGate::new();
+            accounts.gate_next_handback(handback.clone());
+            let held = tokio::spawn(post_switch(app.clone(), first));
+            handback.wait_reached().await;
+            assert_eq!(accounts.active_slot().await, first, "committed, held");
+            assert_eq!(post_switch(app.clone(), last).await, StatusCode::OK);
+            handback.release();
+            assert_eq!(held.await.unwrap(), StatusCode::OK);
+
+            let order = format!("{first} then {last}");
+            let health = get_json(&app, "/health").await;
+            assert_eq!(health["account_router"]["active_slot"], last, "{order}");
+            // Primary fetched the answer held: it is live only while primary
+            // is the slot left active.
+            let primary_left_active = last == "primary";
+            assert_eq!(
+                health["model_catalog"]["source"],
+                if primary_left_active { "live" } else { "stale" },
+                "{order}: {health}"
+            );
+            assert_eq!(health["model_catalog"]["slot"], "primary", "{order}");
+
+            let models = get_json(&app, "/v1/models").await;
+            assert_eq!(
+                models["relay_catalog"],
+                json!({"source": "live", "slot": last}),
+                "{order}"
+            );
+            assert_eq!(models["data"].as_array().unwrap().len(), 1, "{order}");
+            assert_eq!(
+                models["data"][0]["id"],
+                model_for(&format!("acct-{last}")),
+                "{order}"
+            );
+            let health = get_json(&app, "/health").await;
+            assert_eq!(health["account_router"]["active_slot"], last, "{order}");
+            assert_eq!(health["model_catalog"]["source"], "live", "{order}");
+            assert_eq!(health["model_catalog"]["slot"], last, "{order}");
+            // No refresh beyond the one the slot left active needed.
+            assert_eq!(backend.hits("acct-primary"), 1, "{order}");
+            assert_eq!(
+                backend.hits("acct-secondary"),
+                usize::from(!primary_left_active),
+                "{order}"
+            );
+        }
     }
 
     async fn http_post(root: &std::path::Path, upstream_url: String) -> (Response, AccountRouter) {
