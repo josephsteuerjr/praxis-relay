@@ -11,7 +11,7 @@ use url::Url;
 
 #[cfg(test)]
 use crate::core::account_router::TestCommitGate;
-use crate::core::account_router::{AccountRouter, DownstreamCancellation};
+use crate::core::account_router::{AccountRouter, DownstreamCancellation, QuotaReset};
 use crate::core::config::Config;
 use crate::core::models::{
     ChatRequest, ImageUrlContent, Message, MessageContent, MessageContentPart, RelayTerminal,
@@ -975,11 +975,19 @@ pub async fn stream_chat_completions(
                         if subscription_quota_error(status, &response_body)
                             && !account_failover_done
                         {
+                            // The reset the vendor named decides how long the spent
+                            // slot stays parked; without one, the configured cooldown.
+                            let (resets_at, resets_in_seconds) =
+                                quota_reset_from_body(&response_body);
+                            let reset = QuotaReset {
+                                resets_at,
+                                resets_in_seconds,
+                            };
                             let switch_result = tokio::select! {
                                 biased;
                                 _ = tx.closed() => return,
                                 result = account_router
-                                    .switch_after_quota_for_downstream(&account, &cancellation) => result,
+                                    .switch_after_quota_for_downstream(&account, reset, &cancellation) => result,
                             };
                             match switch_result {
                                 Ok(standby) => {
@@ -1005,11 +1013,16 @@ pub async fn stream_chat_completions(
                         // означал полную немоту. Пробуем ровно один раз, как и с квотой:
                         // 401 приходит ДО начала SSE, повтор не может задвоить текст.
                         if subscription_auth_error(status) && !account_failover_done {
+                            // A 401 names no reset, whatever its body says: the slot
+                            // is parked for the configured cooldown, as before.
                             let switch_result = tokio::select! {
                                 biased;
                                 _ = tx.closed() => return,
-                                result = account_router
-                                    .switch_after_quota_for_downstream(&account, &cancellation) => result,
+                                result = account_router.switch_after_quota_for_downstream(
+                                    &account,
+                                    QuotaReset::default(),
+                                    &cancellation,
+                                ) => result,
                             };
                             match switch_result {
                                 Ok(standby) => {

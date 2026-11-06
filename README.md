@@ -161,8 +161,12 @@ See [OpenAI Fast mode documentation](https://developers.openai.com/api/docs/guid
 and [Codex speed configuration](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
 A listed model is not proof of account entitlement. Quota exhaustion may move
-new requests to a distinct configured account. Additional model quota buckets
-remain separate; switching accounts does not merge or transfer them.
+new requests to a distinct configured account. The exhausted account is then
+skipped as a failover target until the reset time the vendor reported, kept
+between 60 seconds and 7 days, or for `RELAY_ACCOUNT_COOLDOWN_SECONDS`
+(15 minutes by default) when no usable reset was reported. A deliberate switch
+clears that wait. Additional model quota buckets remain separate; switching
+accounts does not merge or transfer them.
 
 ## Desktop preferences and headless configuration
 

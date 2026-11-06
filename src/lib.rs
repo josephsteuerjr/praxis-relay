@@ -827,6 +827,375 @@ mod tests {
         }
     }
 
+    fn relay_app(root: &std::path::Path, accounts: AccountRouter) -> Router {
+        app_router(AppState {
+            api_key: None,
+            config: Arc::new(Config {
+                codex_home: root.to_path_buf(),
+                chatgpt_base_url: String::new(),
+                model: "gpt-5.6-sol".to_string(),
+                user_instructions: None,
+                reasoning_effort: None,
+                instructions_mode: Some("minimal".to_string()),
+                parallel_tool_calls: false,
+            }),
+            accounts,
+            limits: LimitsCache::default(),
+            catalog: ModelCatalog::static_only(),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    async fn cooldown_left(accounts: &AccountRouter, slot: &str) -> i64 {
+        accounts
+            .describe()
+            .await
+            .into_iter()
+            .find(|view| view.slot == slot)
+            .unwrap()
+            .cooldown_seconds_left
+    }
+
+    /// The turn takes a moment, so a park may already have run down by a few
+    /// seconds, but it may never last longer than `expected`.
+    fn assert_parked_for(left: i64, expected: i64, case: &str) {
+        assert!(
+            (expected - 5..=expected).contains(&left),
+            "{case}: parked for {left}s, expected {expected}s"
+        );
+    }
+
+    /// A quota 429 parks the spent slot until the reset the vendor named, kept
+    /// within 60 seconds..=7 days. An absent, malformed, nonpositive or past reset
+    /// keeps the configured cooldown, and so does every 401, whatever its body says.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn http_quota_failover_parks_the_spent_slot_until_the_vendor_reset() {
+        let _lever = chat_completions::test_lever_guard();
+        let now = chrono::Utc::now().timestamp();
+        let quota = |reset: serde_json::Value| {
+            let mut error = json!({"code": "usage_limit_reached"});
+            for (key, value) in reset.as_object().unwrap() {
+                error[key] = value.clone();
+            }
+            json!({ "error": error }).to_string()
+        };
+        let week = 7 * 24 * 60 * 60;
+        // (case, primary status, primary body, expected park; None = configured cooldown)
+        let cases = [
+            (
+                "relative reset",
+                429u16,
+                quota(json!({"resets_in_seconds": 7200})),
+                Some(7200),
+            ),
+            (
+                "absolute reset",
+                429,
+                quota(json!({"resets_at": now + 5400})),
+                Some(5400),
+            ),
+            (
+                "relative reset wins over absolute",
+                429,
+                quota(json!({"resets_in_seconds": 3000, "resets_at": now + 9000})),
+                Some(3000),
+            ),
+            (
+                "short reset rises to 60s",
+                429,
+                quota(json!({"resets_in_seconds": 5})),
+                Some(60),
+            ),
+            (
+                "long reset falls to 7 days",
+                429,
+                quota(json!({"resets_in_seconds": 30 * 24 * 60 * 60})),
+                Some(week),
+            ),
+            (
+                "far absolute reset falls to 7 days",
+                429,
+                quota(json!({"resets_at": i64::MAX})),
+                Some(week),
+            ),
+            ("no reset", 429, quota(json!({})), None),
+            (
+                "malformed reset",
+                429,
+                quota(json!({"resets_in_seconds": "3600"})),
+                None,
+            ),
+            (
+                "zero reset",
+                429,
+                quota(json!({"resets_in_seconds": 0})),
+                None,
+            ),
+            (
+                "negative reset",
+                429,
+                quota(json!({"resets_in_seconds": -30})),
+                None,
+            ),
+            (
+                "past reset",
+                429,
+                quota(json!({"resets_at": now - 100})),
+                None,
+            ),
+            (
+                "quota body is not JSON",
+                429,
+                "usage_limit_reached".to_string(),
+                None,
+            ),
+            (
+                "401 whose body names a reset",
+                401,
+                json!({"error": {"message": "expired", "resets_in_seconds": 7200}}).to_string(),
+                None,
+            ),
+        ];
+        for (case, primary_status, primary_body, expected) in cases {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_server = seen.clone();
+            let upstream = Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+                let seen = seen_server.clone();
+                let primary_body = primary_body.clone();
+                async move {
+                    let account_id = headers["chatgpt-account-id"].to_str().unwrap().to_string();
+                    seen.lock().unwrap().push(account_id.clone());
+                    if account_id == "acct-primary" {
+                        return Response::builder()
+                            .status(primary_status)
+                            .body(Body::from(primary_body))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}}\n\n\
+                             data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, upstream).await;
+            });
+            let root = tempdir().unwrap();
+            write_test_account(root.path(), "primary", "acct-primary");
+            write_test_account(root.path(), "secondary", "acct-secondary");
+            let (response, accounts) =
+                http_post(root.path(), format!("http://{addr}/responses")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let wire = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                wire.contains(r#""content":"ok""#),
+                "{case}: the standby must answer the same turn: {wire}"
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                ["acct-primary", "acct-secondary"],
+                "{case}"
+            );
+            assert_eq!(accounts.active_slot().await, "secondary", "{case}");
+            let expected = expected.unwrap_or_else(|| accounts.configured_cooldown_seconds());
+            assert_parked_for(cooldown_left(&accounts, "primary").await, expected, case);
+            assert_eq!(cooldown_left(&accounts, "secondary").await, 0, "{case}");
+            // The deadline is what survives a restart, so it must reach the disk.
+            let persisted: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.path().join("router-state.json")).unwrap(),
+            )
+            .unwrap();
+            let until = persisted["exhausted_until"]["primary"].as_i64().unwrap();
+            assert_parked_for(until - chrono::Utc::now().timestamp(), expected, case);
+            chat_completions::set_test_upstream_url(None);
+        }
+    }
+
+    /// `/v1/limits` is an exhaustion signal of its own. The usage document says
+    /// "limit reached" for the subscription as a whole, so the reset is taken only
+    /// from windows that report themselves full; when that attribution fails, the
+    /// configured cooldown stays rather than a guessed reset.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn http_limits_failover_parks_until_the_full_window_resets() {
+        let _lever = chat_completions::test_lever_guard();
+        let now = chrono::Utc::now().timestamp();
+        let window = |used: u64, reset: serde_json::Value| {
+            let mut window = json!({"used_percent": used, "limit_window_seconds": 18000});
+            for (key, value) in reset.as_object().unwrap() {
+                window[key] = value.clone();
+            }
+            window
+        };
+        let usage = |exhausted: bool, primary: serde_json::Value, secondary: serde_json::Value| {
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": !exhausted,
+                    "limit_reached": exhausted,
+                    "primary_window": primary,
+                    "secondary_window": secondary
+                }
+            })
+        };
+        let healthy = usage(
+            false,
+            window(10, json!({"reset_after_seconds": 9000})),
+            window(5, json!({"reset_after_seconds": 500000})),
+        );
+        // (case, usage of the primary account, expected park; None = configured cooldown)
+        let cases = [
+            (
+                "the full window names its reset time",
+                usage(
+                    true,
+                    window(100, json!({"reset_at": now + 7200})),
+                    window(40, json!({"reset_after_seconds": 400000})),
+                ),
+                Some(7200),
+            ),
+            (
+                "both windows full: the later reset binds",
+                usage(
+                    true,
+                    window(100, json!({"reset_after_seconds": 3600})),
+                    window(100, json!({"reset_after_seconds": 200000})),
+                ),
+                Some(200000),
+            ),
+            (
+                "refused, but no window reports itself full",
+                usage(
+                    true,
+                    window(80, json!({"reset_after_seconds": 3600})),
+                    window(40, json!({"reset_after_seconds": 400000})),
+                ),
+                None,
+            ),
+            (
+                "the full window names no reset",
+                usage(
+                    true,
+                    window(100, json!({})),
+                    window(40, json!({"reset_after_seconds": 400000})),
+                ),
+                None,
+            ),
+            (
+                "one of two full windows names no reset",
+                usage(
+                    true,
+                    window(100, json!({"reset_after_seconds": 3600})),
+                    window(100, json!({})),
+                ),
+                None,
+            ),
+        ];
+        for (case, primary_usage, expected) in cases {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_server = seen.clone();
+            let healthy = healthy.clone();
+            let upstream = Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+                let seen = seen_server.clone();
+                let primary_usage = primary_usage.clone();
+                let healthy = healthy.clone();
+                async move {
+                    let account_id = headers["chatgpt-account-id"].to_str().unwrap().to_string();
+                    seen.lock().unwrap().push(account_id.clone());
+                    Json(if account_id == "acct-primary" {
+                        primary_usage
+                    } else {
+                        healthy
+                    })
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, upstream).await;
+            });
+            crate::core::limits::set_test_usage_url(Some(format!(
+                "http://{addr}/backend-api/wham/usage"
+            )));
+            let root = tempdir().unwrap();
+            write_test_account(root.path(), "primary", "acct-primary");
+            write_test_account(root.path(), "secondary", "acct-secondary");
+            let accounts = AccountRouter::load(root.path()).await.unwrap();
+            let response = relay_app(root.path(), accounts.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/limits")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["relay_account"]["active_slot"], "secondary", "{case}");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                ["acct-primary", "acct-secondary"],
+                "{case}"
+            );
+            assert_eq!(accounts.active_slot().await, "secondary", "{case}");
+            let expected = expected.unwrap_or_else(|| accounts.configured_cooldown_seconds());
+            assert_parked_for(cooldown_left(&accounts, "primary").await, expected, case);
+            assert_eq!(cooldown_left(&accounts, "secondary").await, 0, "{case}");
+            crate::core::limits::set_test_usage_url(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_switch_refusal_names_only_configured_slots() {
+        for (configured, listed) in [(&["primary"][..], "primary"), (&[][..], "none")] {
+            let root = tempdir().unwrap();
+            for slot in configured {
+                write_test_account(root.path(), slot, &format!("acct-{slot}"));
+            }
+            let accounts = AccountRouter::open(root.path()).await.unwrap();
+            let response = relay_app(root.path(), accounts.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/account/switch")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"slot": "secondary"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "switch_refused");
+            assert_eq!(
+                body["error"]["message"],
+                format!("account slot \"secondary\" is not configured (configured: {listed})")
+            );
+            assert_eq!(accounts.account_count(), configured.len());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn dropping_http_sse_body_cancels_pending_upstream_read() {

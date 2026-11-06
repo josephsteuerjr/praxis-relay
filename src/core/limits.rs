@@ -15,11 +15,36 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::core::account_router::{AccountLease, AccountRouter};
+use crate::core::account_router::{AccountLease, AccountRouter, QuotaReset};
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_USAGE_BODY_BYTES: usize = 1024 * 1024;
+
+/// The usage address is a constant in release builds. As with the Responses
+/// upstream in `chat_completions`, the seam exists only in the test build, so a
+/// test can walk the same HTTP path as `/v1/limits` without the vendor.
+#[cfg(test)]
+static TEST_USAGE_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_test_usage_url(url: Option<String>) {
+    *TEST_USAGE_URL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = url;
+}
+
+fn usage_url() -> String {
+    #[cfg(test)]
+    {
+        if let Ok(guard) = TEST_USAGE_URL.lock() {
+            if let Some(url) = guard.as_ref() {
+                return url.clone();
+            }
+        }
+    }
+    CHATGPT_USAGE_URL.to_string()
+}
 
 #[derive(Clone, Default)]
 pub struct LimitsCache {
@@ -47,7 +72,8 @@ impl LimitsCache {
         // before returning so the whole relay, not just this caller, observes
         // the standby as active.
         if subscription_exhausted(&value) && router.account_count() > 1 {
-            match router.switch_after_quota(&serving).await {
+            let reset = exhausted_window_reset(&value, Utc::now().timestamp());
+            match router.switch_after_quota(&serving, reset).await {
                 Ok(standby) => {
                     serving = standby;
                     value = self.get_for_account(&serving).await?;
@@ -91,7 +117,7 @@ impl LimitsCache {
 
 async fn fetch_usage(account: &AccountLease) -> Result<Value> {
     let response = reqwest::Client::new()
-        .get(CHATGPT_USAGE_URL)
+        .get(usage_url())
         .bearer_auth(&account.access_token)
         .header("ChatGPT-Account-ID", &account.account_id)
         .header(
@@ -135,6 +161,42 @@ pub fn subscription_exhausted(value: &Value) -> bool {
             .and_then(|rate| rate.get("allowed"))
             .and_then(Value::as_bool)
             == Some(false)
+}
+
+/// The reset of the window that ran out, when the usage document attributes the
+/// exhaustion; otherwise nothing, and the router keeps its configured cooldown.
+///
+/// `limit_reached` and `allowed` speak for the whole subscription, not for one
+/// window, so a window is blamed only when it reports itself full (`used_percent`
+/// of 100 or more). The subscription opens when the last full window resets, so
+/// every full window must name a usable reset. A refusal with no full window, or a
+/// full window without a usable reset, is ambiguous.
+fn exhausted_window_reset(value: &Value, now: i64) -> QuotaReset {
+    let rate = value.get("rate_limit");
+    let mut binding: Option<(u64, QuotaReset)> = None;
+    for name in ["primary_window", "secondary_window"] {
+        let Some(window) = rate.and_then(|rate| rate.get(name)) else {
+            continue;
+        };
+        let full = window
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .is_some_and(|used| used >= 100.0);
+        if !full {
+            continue;
+        }
+        let reset = QuotaReset {
+            resets_at: window.get("reset_at").and_then(Value::as_i64),
+            resets_in_seconds: window.get("reset_after_seconds").and_then(Value::as_i64),
+        };
+        let Some(seconds) = reset.seconds_after(now) else {
+            return QuotaReset::default();
+        };
+        if binding.is_none_or(|(latest, _)| seconds > latest) {
+            binding = Some((seconds, reset));
+        }
+    }
+    binding.map(|(_, reset)| reset).unwrap_or_default()
 }
 
 fn normalized_window(value: Option<&Value>) -> Value {
