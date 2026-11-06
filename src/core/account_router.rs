@@ -38,6 +38,15 @@ pub struct AccountRouter {
     lease_gate: Arc<std::sync::Mutex<Option<Arc<TestGate>>>>,
     #[cfg(test)]
     commit_gate: Arc<std::sync::Mutex<Option<Arc<TestCommitGate>>>>,
+    /// Where the next deliberate switch stops once committed -- the state
+    /// lock released, its lease not yet handed back to the caller.
+    #[cfg(test)]
+    handback_gate: Arc<std::sync::Mutex<Option<Arc<TestGate>>>>,
+    /// What the next `login` gets instead of running the browser OAuth
+    /// helper -- a staged profile, or an OAuth failure -- so a sign-in can be
+    /// driven end to end in tests.
+    #[cfg(test)]
+    staged_login: Arc<std::sync::Mutex<Option<std::io::Result<tempfile::TempDir>>>>,
 }
 
 /// A linearization guard shared with the downstream receiver. Receiver drop
@@ -261,6 +270,10 @@ impl AccountRouter {
             lease_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             commit_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            handback_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            staged_login: Arc::new(std::sync::Mutex::new(None)),
         };
         router.persist(&state)?;
 
@@ -486,7 +499,15 @@ impl AccountRouter {
     /// A deliberate switch also clears that slot's cooldown: the timer was our
     /// guess about when the subscription might be usable again, and an explicit
     /// decision outranks a guess.  Genuine exhaustion re-arms it on the next 429.
-    pub async fn switch_to(&self, slot: &str) -> Result<AccountLease> {
+    ///
+    /// `switched` runs once, with the selected slot, synchronously and under
+    /// the state lock (so it must not block), the moment the move is
+    /// committed: persisted and live. That lock serializes commits, so
+    /// overlapping switches report in the order they took effect and the
+    /// last report names the slot left active; a caller told only once this
+    /// returns could hear an earlier switch last. A switch to the active slot
+    /// reports too; one that fails, having moved nothing, never runs it.
+    pub async fn switch_to(&self, slot: &str, switched: impl FnOnce(&str)) -> Result<AccountLease> {
         let wanted = slot.trim();
         if !self
             .accounts
@@ -516,10 +537,16 @@ impl AccountRouter {
         next.exhausted_until.remove(&target.slot);
         self.persist(&next)?;
         *state = next;
+        // Still under the lock: no later switch can commit, let alone
+        // report, before this report is in.
+        switched(&target.slot);
         info!(
             "subscription switched deliberately: {} -> {}",
             previous, target.slot
         );
+        drop(state);
+        #[cfg(test)]
+        self.stop_at_gate(&self.handback_gate).await;
         Ok(target)
     }
 
@@ -533,19 +560,36 @@ impl AccountRouter {
 
     /// Share the refresh lock with login/logout so refresh cannot resurrect a
     /// removed credential file. Existing requests may finish their leased turn.
-    pub async fn logout(&self, slot: &str) -> Result<bool> {
+    ///
+    /// `credentials_changed` runs once, synchronously and under that lock (so
+    /// it must not block), the moment the first credential file is gone:
+    /// before the legacy cleanup and the state write, either of which can
+    /// still fail, and before the next await, where the call can be
+    /// cancelled. A sign-out with nothing to remove runs it on success
+    /// instead; one that fails before removing anything never runs it.
+    pub async fn logout(&self, slot: &str, credentials_changed: impl FnOnce()) -> Result<bool> {
         let account = self
             .accounts
             .iter()
             .find(|a| a.slot == slot)
             .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))?;
         let _guard = account.refresh_lock.lock().await;
-        let mut removed = crate::login::lib::logout(&account.auth_home)?;
+        let mut credentials_changed = Some(credentials_changed);
+        let mut remove = |codex_home: &Path| -> std::io::Result<bool> {
+            let removed = crate::login::lib::logout(codex_home)?;
+            if removed {
+                if let Some(report) = credentials_changed.take() {
+                    report();
+                }
+            }
+            Ok(removed)
+        };
+        let mut removed = remove(&account.auth_home)?;
         if slot == "primary" {
             // Remove both historical representations of this slot. Otherwise a
             // restart could silently resurrect an ignored legacy auth.json.
-            removed |= crate::login::lib::logout(&self.auth_root)?;
-            removed |= crate::login::lib::logout(&self.auth_root.join("accounts/primary"))?;
+            removed |= remove(&self.auth_root)?;
+            removed |= remove(&self.auth_root.join("accounts/primary"))?;
         }
         let mut state = self.state.lock().await;
         let mut next = state.clone();
@@ -561,10 +605,19 @@ impl AccountRouter {
         }
         self.persist(&next)?;
         *state = next;
+        // Nothing was there to remove, and the slot is signed out all the same.
+        if let Some(report) = credentials_changed.take() {
+            report();
+        }
         Ok(removed)
     }
 
-    pub async fn login(&self, slot: &str) -> Result<()> {
+    /// `credentials_changed` runs once, synchronously and under the slot's
+    /// refresh lock (so it must not block), the moment the new credentials are
+    /// installed: before the state write, which can still fail, and before the
+    /// next await, where the call can be cancelled. A sign-in that fails or is
+    /// cancelled before the install -- in OAuth, say -- never runs it.
+    pub async fn login(&self, slot: &str, credentials_changed: impl FnOnce()) -> Result<()> {
         let account = self
             .accounts
             .iter()
@@ -572,15 +625,52 @@ impl AccountRouter {
             .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))?;
         // OAuth is staged away from live credentials. A failed/cancelled login
         // leaves the previous account usable; only the final replace is locked.
-        let staged = crate::login::lib::staged_chatgpt_login(&account.auth_home).await?;
+        let staged = self.stage_login(&account.auth_home).await?;
         let _guard = account.refresh_lock.lock().await;
         crate::login::lib::install_staged_login(staged.path(), &account.auth_home)?;
+        // The slot holds the new account from here on, whatever happens next.
+        credentials_changed();
         let mut state = self.state.lock().await;
         let mut next = state.clone();
         next.exhausted_until.remove(slot);
         self.persist(&next)?;
         *state = next;
         Ok(())
+    }
+
+    /// The browser OAuth helper's staged profile -- or, in tests, what
+    /// `stage_next_login` or `fail_next_login` handed over.
+    async fn stage_login(&self, auth_home: &Path) -> std::io::Result<tempfile::TempDir> {
+        #[cfg(test)]
+        {
+            let staged = self
+                .staged_login
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(staged) = staged {
+                return staged;
+            }
+        }
+        crate::login::lib::staged_chatgpt_login(auth_home).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_next_login(&self, staged: tempfile::TempDir) {
+        *self
+            .staged_login
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Ok(staged));
+    }
+
+    /// The next `login` fails in OAuth, as a closed browser would, before any
+    /// credential is touched.
+    #[cfg(test)]
+    pub(crate) fn fail_next_login(&self, error: std::io::Error) {
+        *self
+            .staged_login
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Err(error));
     }
 
     pub(crate) async fn lease_slot(&self, slot: &str) -> Result<AccountLease> {
@@ -657,6 +747,17 @@ impl AccountRouter {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
     }
 
+    /// The next deliberate switch stops once it has committed and released
+    /// the state lock, before handing its lease back: the window in which a
+    /// report made by the caller could be overtaken by a later switch.
+    #[cfg(test)]
+    pub(crate) fn gate_next_handback(&self, gate: Arc<TestGate>) {
+        *self
+            .handback_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
     fn persist(&self, state: &PersistentState) -> Result<()> {
         let parent = self
             .state_file
@@ -729,11 +830,15 @@ mod tests {
         assert!(router.lease_any().await.is_err());
         write_account(root.path(), "secondary", "acct-secondary");
         assert_eq!(
-            router.switch_to("secondary").await.unwrap().account_id,
+            router
+                .switch_to("secondary", |_| {})
+                .await
+                .unwrap()
+                .account_id,
             "acct-secondary"
         );
         assert_eq!(router.account_count(), 1);
-        router.logout("secondary").await.unwrap();
+        router.logout("secondary", || {}).await.unwrap();
         assert_eq!(router.account_count(), 0);
         assert!(router.lease_any().await.is_err());
         assert_eq!(
@@ -752,8 +857,8 @@ mod tests {
         let router = AccountRouter::load(root.path()).await.unwrap();
         write_account(root.path(), "secondary", "acct-secondary");
         assert_eq!(router.account_count(), 2);
-        router.switch_to("secondary").await.unwrap();
-        router.logout("secondary").await.unwrap();
+        router.switch_to("secondary", |_| {}).await.unwrap();
+        router.logout("secondary", || {}).await.unwrap();
         assert_eq!(router.lease_any().await.unwrap().account_id, "acct-primary");
     }
 
@@ -767,7 +872,7 @@ mod tests {
         )
         .unwrap();
         let router = AccountRouter::load(root.path()).await.unwrap();
-        router.logout("primary").await.unwrap();
+        router.logout("primary", || {}).await.unwrap();
         assert_eq!(
             AccountRouter::open(root.path())
                 .await
@@ -784,11 +889,171 @@ mod tests {
         write_account(root.path(), "primary", "acct-primary");
         let original = fs::read(root.path().join("accounts/primary/auth.json")).unwrap();
         let router = AccountRouter::load(root.path()).await.unwrap();
-        assert!(router.logout("../../.codex").await.is_err());
+        assert!(router.logout("../../.codex", || {}).await.is_err());
         assert_eq!(
             fs::read(root.path().join("accounts/primary/auth.json")).unwrap(),
             original
         );
+    }
+
+    /// A `credentials_changed` callback that counts its calls.
+    fn counting(calls: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    /// Yield to the task under test until it has reported `n` changes in all.
+    async fn reported(calls: &AtomicUsize, n: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(AtomicOrdering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the credential change is reported before the state lock");
+    }
+
+    /// A directory where `path` names a file: removing or replacing it fails.
+    fn occupy(path: &Path) {
+        let _ = fs::remove_file(path);
+        fs::create_dir_all(path.join("occupied")).unwrap();
+    }
+
+    /// The account primary's credentials name right now.
+    async fn primary_account(router: &AccountRouter) -> String {
+        router.lease_slot("primary").await.unwrap().account_id
+    }
+
+    /// Primary's credentials are gone the moment its auth.json is, and the
+    /// caller hears so then: neither a legacy cleanup nor a state write that
+    /// fails afterwards, nor a cancellation at the state lock, swallows it.
+    #[tokio::test]
+    async fn logout_reports_the_removal_even_when_a_later_step_fails_or_is_cancelled() {
+        for later in ["legacy cleanup", "state write", "cancellation"] {
+            let root = tempdir().unwrap();
+            write_account(root.path(), "primary", "acct-primary");
+            let router = AccountRouter::load(root.path()).await.unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let ended = if later == "cancellation" {
+                let held = router.state.lock().await;
+                let task = tokio::spawn({
+                    let router = router.clone();
+                    let report = counting(&calls);
+                    async move { router.logout("primary", report).await }
+                });
+                reported(&calls, 1).await;
+                task.abort();
+                let ended = task.await.unwrap_err();
+                assert!(ended.is_cancelled());
+                drop(held);
+                ended.to_string()
+            } else {
+                occupy(&root.path().join(match later {
+                    "legacy cleanup" => "auth.json",
+                    _ => "router-state.json",
+                }));
+                let error = router
+                    .logout("primary", counting(&calls))
+                    .await
+                    .unwrap_err();
+                format!("{error:#}")
+            };
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "{later}: {ended}");
+            assert!(
+                !root.path().join("accounts/primary/auth.json").exists(),
+                "{later}"
+            );
+        }
+    }
+
+    /// A sign-out that fails before removing anything reports nothing. One
+    /// that finds nothing to remove reports once it succeeds: the slot is
+    /// signed out all the same.
+    #[tokio::test]
+    async fn logout_reports_nothing_before_a_removal_and_an_empty_slot_on_success() {
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(router.logout("tertiary", counting(&calls)).await.is_err());
+        occupy(&root.path().join("accounts/secondary/auth.json"));
+        assert!(router.logout("secondary", counting(&calls)).await.is_err());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+
+        fs::remove_dir_all(root.path().join("accounts/secondary/auth.json")).unwrap();
+        assert!(!router.logout("secondary", counting(&calls)).await.unwrap());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(root.path().join("accounts/primary/auth.json").is_file());
+    }
+
+    /// A sign-in changes the slot's credentials at one point: the install of
+    /// the staged profile. The caller hears so then -- neither a state write
+    /// that fails afterwards nor a cancellation at the state lock swallows it
+    /// -- and never before: an OAuth failure, or a cancellation while the
+    /// install still waits for the refresh lock, leaves the old account in
+    /// place and reports nothing.
+    #[tokio::test]
+    async fn login_reports_an_installed_replacement_and_nothing_before_it() {
+        use crate::core::catalog::test_support::staged_login;
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-first");
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sign_in = |report| {
+            let router = router.clone();
+            tokio::spawn(async move { router.login("primary", report).await })
+        };
+
+        router.fail_next_login(std::io::Error::other("the browser was closed"));
+        let error = router.login("primary", counting(&calls)).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("browser was closed"),
+            "{error:#}"
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(primary_account(&router).await, "acct-first");
+
+        // OAuth is over once the staged profile is taken; the install then
+        // waits for the refresh lock held here, and the sign-in is cancelled.
+        let primary = router.accounts.iter().find(|a| a.slot == "primary");
+        let refresh = primary.unwrap().refresh_lock.lock().await;
+        router.stage_next_login(staged_login("primary", "acct-second"));
+        let task = sign_in(counting(&calls));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while router.staged_login.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the sign-in takes its staged profile");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(refresh);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(primary_account(&router).await, "acct-first");
+
+        // Installed, then cancelled while the state lock is held here.
+        let held = router.state.lock().await;
+        router.stage_next_login(staged_login("primary", "acct-second"));
+        let task = sign_in(counting(&calls));
+        reported(&calls, 1).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert_eq!(primary_account(&router).await, "acct-second");
+
+        // Installed, then the state write fails.
+        occupy(&root.path().join("router-state.json"));
+        router.stage_next_login(staged_login("primary", "acct-third"));
+        let error = router.login("primary", counting(&calls)).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("account router state"),
+            "{error:#}"
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(primary_account(&router).await, "acct-third");
     }
 
     #[tokio::test]
@@ -814,7 +1079,7 @@ mod tests {
         let router = AccountRouter::load(root.path()).await.unwrap();
         assert_eq!(router.active_slot().await, "primary");
 
-        let moved = router.switch_to("secondary").await.unwrap();
+        let moved = router.switch_to("secondary", |_| {}).await.unwrap();
         assert_eq!(moved.slot, "secondary");
         assert_eq!(router.active_slot().await, "secondary");
 
@@ -828,7 +1093,7 @@ mod tests {
         write_account(root.path(), "primary", "acct-primary");
         write_account(root.path(), "secondary", "acct-secondary");
         let router = AccountRouter::load(root.path()).await.unwrap();
-        let same = router.switch_to("primary").await.unwrap();
+        let same = router.switch_to("primary", |_| {}).await.unwrap();
         assert_eq!(same.slot, "primary");
         assert_eq!(router.active_slot().await, "primary");
     }
@@ -838,7 +1103,7 @@ mod tests {
         let root = tempdir().unwrap();
         write_account(root.path(), "primary", "acct-primary");
         let router = AccountRouter::load(root.path()).await.unwrap();
-        let error = match router.switch_to("tertiary").await {
+        let error = match router.switch_to("tertiary", |_| {}).await {
             Ok(_) => panic!("an unconfigured slot was accepted"),
             Err(error) => error.to_string(),
         };
@@ -864,7 +1129,7 @@ mod tests {
             "quota exhaustion must park the spent slot"
         );
 
-        router.switch_to("primary").await.unwrap();
+        router.switch_to("primary", |_| {}).await.unwrap();
         let parked = router
             .describe()
             .await
@@ -873,6 +1138,70 @@ mod tests {
             .unwrap();
         assert!(parked.active);
         assert_eq!(parked.cooldown_seconds_left, 0);
+    }
+
+    /// What each `switched` callback saw: the slot it was told, the active
+    /// slot persisted at that moment, and whether the state lock was held.
+    type SwitchReports = Arc<std::sync::Mutex<Vec<(String, String, bool)>>>;
+
+    fn recording(router: &AccountRouter, reports: &SwitchReports) -> impl FnOnce(&str) {
+        let router = router.clone();
+        let reports = reports.clone();
+        move |slot: &str| {
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&fs::read(router.state_file.as_ref()).unwrap()).unwrap();
+            let locked = router.state.try_lock().is_err();
+            reports.lock().unwrap().push((
+                slot.to_string(),
+                persisted["active"].as_str().unwrap_or_default().to_string(),
+                locked,
+            ));
+        }
+    }
+
+    /// A deliberate switch -- to the active slot too -- reports the slot it
+    /// selected from inside its commit: already persisted, and with the
+    /// state lock still held, so no other switch can commit in between. One
+    /// that moved nothing -- an unconfigured or unusable slot, a refused
+    /// state write -- reports nothing.
+    #[tokio::test]
+    async fn a_switch_reports_its_target_inside_the_commit_and_only_once_it_moved() {
+        let root = tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        write_account(root.path(), "secondary", "acct-secondary");
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let reports = SwitchReports::default();
+        for slot in ["secondary", "secondary"] {
+            router
+                .switch_to(slot, recording(&router, &reports))
+                .await
+                .unwrap();
+        }
+        let inside = |slot: &str| (slot.to_string(), slot.to_string(), true);
+        assert_eq!(
+            *reports.lock().unwrap(),
+            [inside("secondary"), inside("secondary")]
+        );
+
+        assert!(router
+            .switch_to("tertiary", recording(&router, &reports))
+            .await
+            .is_err());
+        let primary = root.path().join("accounts/primary/auth.json");
+        let healthy = fs::read(&primary).unwrap();
+        fs::write(&primary, b"not json at all").unwrap();
+        assert!(router
+            .switch_to("primary", recording(&router, &reports))
+            .await
+            .is_err());
+        fs::write(&primary, healthy).unwrap();
+        occupy(&root.path().join("router-state.json"));
+        assert!(router
+            .switch_to("primary", recording(&router, &reports))
+            .await
+            .is_err());
+        assert_eq!(reports.lock().unwrap().len(), 2, "nothing moved");
+        assert_eq!(router.active_slot().await, "secondary");
     }
 
     /// ЖИВОЙ СЛУЧАЙ 13.08.2026, ради которого написан lease_any: файл активного слота

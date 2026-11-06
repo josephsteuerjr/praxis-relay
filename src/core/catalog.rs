@@ -11,8 +11,25 @@
 //!
 //! Degradation is explicit, never silent: when the backend cannot be asked (no
 //! subscription, network, 5xx) the last good answer keeps serving; with no
-//! answer ever, the static [`FALLBACK_MODELS`] list stands in. `/health`
-//! reports which of the three is live.
+//! answer ever, the static [`FALLBACK_MODELS`] list stands in. `/health` and
+//! `/v1/models` report which of the three is live.
+//!
+//! The backend answers per account, and two subscriptions need not be offered
+//! the same models, so every answer is bound to the slot whose credentials
+//! fetched it. That is the lease's own slot: discovery leases with `lease_any`,
+//! which may fail over to the standby (and park the active slot) on the way,
+//! so "the slot that was active" would be a guess. A deliberate switch to
+//! another slot invalidates the answer: the next read refreshes it at once, and
+//! until a refresh succeeds the old answer serves only as the last good one --
+//! `stale`, under the slot that really fetched it. Automatic failover
+//! invalidates nothing: the TTL rebinds the answer, and the slot it reports
+//! stays true in the meantime.
+//!
+//! Signing a slot out, or in again, retires the answer its old credentials
+//! fetched: it is forgotten, not kept as `stale`, because those credentials
+//! are no longer this relay's and the slot would now name someone else, or no
+//! one. The next read asks at once, past any retry cooldown -- a cold start
+//! with no subscription to ask arms one moments before the first sign-in.
 //!
 //! Why this exists: the static list was edited for 5.6 (three times), for
 //! Spark, and would have been edited again for gpt-6-astra -- a rebuild and a
@@ -24,6 +41,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -31,7 +49,7 @@ use tracing::{info, warn};
 
 use crate::core::account_router::AccountRouter;
 use crate::core::chat_completions::{codex_cli_version, codex_user_agent, CODEX_ORIGINATOR};
-use crate::core::models::{Model, ModelList, FALLBACK_MODELS};
+use crate::core::models::{CatalogProvenance, Model, ModelList, FALLBACK_MODELS};
 
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 pub const RELAY_MODELS_TTL_ENV: &str = "RELAY_MODELS_TTL";
@@ -87,9 +105,11 @@ impl CatalogModel {
 pub enum CatalogSource {
     /// A backend answer younger than the TTL.
     Live,
-    /// A backend answer older than the TTL that could not be refreshed.
+    /// A backend answer past the TTL, or fetched through a slot a deliberate
+    /// switch has since moved away from, that has not been refreshed.
     Stale,
-    /// No backend answer at all: [`FALLBACK_MODELS`] (+ extras).
+    /// No backend answer held -- none yet, or a logout or login retired the
+    /// last one: [`FALLBACK_MODELS`] (+ extras).
     Fallback,
     /// Discovery switched off by `RELAY_MODEL_DISCOVERY=off`.
     Static,
@@ -111,6 +131,9 @@ impl CatalogSource {
 pub struct CatalogSnapshot {
     pub models: Vec<CatalogModel>,
     pub source: CatalogSource,
+    /// The slot whose lease fetched the backend answer being served; `None`
+    /// when the static list is serving, which no subscription produced.
+    pub slot: Option<String>,
 }
 
 impl CatalogSnapshot {
@@ -127,10 +150,22 @@ impl CatalogSnapshot {
     }
 }
 
-struct CatalogState {
-    /// Empty until the first successful fetch.
+/// One backend answer, bound to where it came from.
+struct CatalogEntry {
     models: Vec<CatalogModel>,
-    fetched: Option<Instant>,
+    /// The slot whose lease fetched `models`: the lease's own, never the active
+    /// slot read before or after the fetch.
+    slot: String,
+    fetched: Instant,
+    /// A deliberate switch has since selected another slot. Still the last good
+    /// answer, but no longer `live`, and due for a refresh.
+    superseded: bool,
+}
+
+struct CatalogState {
+    /// None until the first successful fetch, and again once a logout or
+    /// login retires the credentials that fetched it.
+    entry: Option<CatalogEntry>,
     last_attempt: Option<Instant>,
     last_error: Option<String>,
 }
@@ -138,9 +173,20 @@ struct CatalogState {
 #[derive(Clone)]
 pub struct ModelCatalog {
     inner: Arc<Mutex<CatalogState>>,
+    /// The slot the latest deliberate switch selected, until the next reader
+    /// applies it under `inner`. A fetch holds `inner` for up to
+    /// REQUEST_TIMEOUT, and a switch must not wait behind it. Written from
+    /// inside the router's commit, so "latest" is the order the switches
+    /// took effect in.
+    pending_switch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Slots whose credentials a logout removed or a login replaced since the
+    /// last reader looked; recorded and applied like `pending_switch`.
+    pending_credentials: Arc<std::sync::Mutex<BTreeSet<String>>>,
     ttl: Duration,
     discovery: bool,
     extra: Vec<String>,
+    /// The backend endpoint; tests point it at a local fixture.
+    url: Arc<str>,
 }
 
 impl ModelCatalog {
@@ -164,33 +210,147 @@ impl ModelCatalog {
             Some("off") | Some("0") | Some("false") | Some("no")
         );
         let extra = parse_extra_models(&std::env::var(RELAY_EXTRA_MODELS_ENV).unwrap_or_default());
-        Self::with(Vec::new(), ttl, discovery, extra)
+        Self::with(ttl, discovery, extra, CODEX_MODELS_URL)
     }
 
     /// The static list only, never a network call: what tests and
     /// `RELAY_MODEL_DISCOVERY=off` deployments run on.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn static_only() -> Self {
-        Self::with(Vec::new(), DEFAULT_TTL, false, Vec::new())
+        Self::with(DEFAULT_TTL, false, Vec::new(), CODEX_MODELS_URL)
     }
 
-    fn with(models: Vec<CatalogModel>, ttl: Duration, discovery: bool, extra: Vec<String>) -> Self {
-        let fetched = if models.is_empty() {
-            None
-        } else {
-            Some(Instant::now())
-        };
+    fn with(ttl: Duration, discovery: bool, extra: Vec<String>, url: &str) -> Self {
         ModelCatalog {
             inner: Arc::new(Mutex::new(CatalogState {
-                models,
-                fetched,
+                entry: None,
                 last_attempt: None,
                 last_error: None,
             })),
+            pending_switch: Arc::new(std::sync::Mutex::new(None)),
+            pending_credentials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             ttl,
             discovery,
             extra,
+            url: Arc::from(url),
         }
+    }
+
+    /// A discovering catalog already holding an answer `slot` fetched just now.
+    #[cfg(test)]
+    fn preloaded(slot: &str, models: Vec<CatalogModel>, ttl: Duration) -> Self {
+        let catalog = Self::with(ttl, true, Vec::new(), CODEX_MODELS_URL);
+        catalog
+            .inner
+            .try_lock()
+            .expect("a new catalog is not shared yet")
+            .entry = Some(CatalogEntry {
+            models,
+            slot: slot.to_string(),
+            fetched: Instant::now(),
+            superseded: false,
+        });
+        catalog
+    }
+
+    /// A deliberate switch selected `slot`. An answer fetched through any other
+    /// slot no longer describes the selected subscription: the next read
+    /// refreshes it regardless of the TTL and the retry cooldown (an explicit
+    /// choice outranks both), and until a refresh succeeds it serves only as the
+    /// last good answer, `stale` and under the slot that fetched it. An answer
+    /// `slot` itself fetched stays exactly as it is. With no answer yet (no
+    /// attempt has succeeded), the next read likewise asks at once, past any
+    /// cooldown a failed attempt armed; until one succeeds the built-in list
+    /// serves as `fallback`.
+    ///
+    /// Never waits: the choice is recorded here and applied by the next reader
+    /// (`/health` included), so a switch cannot stall behind a fetch in flight
+    /// -- nor deadlock with one: the router calls this from inside its commit
+    /// (the `switched` callback of `AccountRouter::switch_to`), under the
+    /// state lock a fetch holding `inner` may be waiting on to lease.
+    /// Recording there, not once the switch has returned, keeps overlapping
+    /// switches in the order they took effect: the slot recorded last is the
+    /// slot left active, never an earlier switch's that landed late.
+    pub fn invalidate_for_switch(&self, slot: &str) {
+        *self
+            .pending_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(slot.to_string());
+    }
+
+    fn apply_pending_switch(&self, state: &mut CatalogState) {
+        let selected = self
+            .pending_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(selected) = selected else {
+            return;
+        };
+        let Some(entry) = state.entry.as_mut() else {
+            // No answer to demote, but a failed attempt (say, a cold start
+            // through the slot just left) may have armed the retry cooldown,
+            // and the switch outranks it all the same: the next read asks at once.
+            state.last_attempt = None;
+            return;
+        };
+        // Assigned, not accumulated: switching back to the slot that fetched the
+        // answer, before anything refreshed it, makes it that slot's answer again.
+        entry.superseded = entry.slot != selected;
+        if entry.superseded {
+            state.last_attempt = None;
+        }
+    }
+
+    /// A logout removed `slot`'s credentials, or a login replaced them. An
+    /// answer `slot` fetched goes with the credentials that fetched it: it is
+    /// forgotten, not demoted to `stale` as after a switch, because they are
+    /// no longer this relay's and `slot` would now name other credentials, or
+    /// none. Until a refresh succeeds, the built-in list serves as `fallback`.
+    /// An answer another slot fetched stays as it is. Either way the retry
+    /// cooldown is lifted -- new or fewer credentials are reason to ask again
+    /// -- so the next read that is due to ask (after a forgotten answer or a
+    /// failed cold start, every read is) asks at once; one ask per sign-in or
+    /// sign-out cannot become a burst.
+    ///
+    /// Never waits, like [`Self::invalidate_for_switch`]: the next reader
+    /// (`/health` included) applies it. That is what lets the router report
+    /// the change from under the slot's refresh lock the moment the credential
+    /// files change, so a logout or login that fails or is cancelled after
+    /// that still retires the answer.
+    pub fn invalidate_for_credential_change(&self, slot: &str) {
+        self.pending_credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(slot.to_string());
+    }
+
+    fn apply_pending_credentials(&self, state: &mut CatalogState) {
+        let changed = std::mem::take(
+            &mut *self
+                .pending_credentials
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if changed.is_empty() {
+            return;
+        }
+        if state
+            .entry
+            .as_ref()
+            .is_some_and(|entry| changed.contains(&entry.slot))
+        {
+            state.entry = None;
+        }
+        state.last_attempt = None;
+    }
+
+    /// Apply what switches, logouts and logins recorded since the last reader.
+    /// The order is immaterial: a credential change only ever removes its own
+    /// slot's answer, and a switch only relabels whatever answer is left.
+    fn apply_pending(&self, state: &mut CatalogState) {
+        self.apply_pending_credentials(state);
+        self.apply_pending_switch(state);
     }
 
     /// The current catalog, refreshed first when older than the TTL.
@@ -222,16 +382,20 @@ impl ModelCatalog {
         model_list_from(&snapshot)
     }
 
-    /// For `/health`: which source is serving and how old it is. No slugs -- the
-    /// list has its own endpoint.
+    /// For `/health`: which source is serving, which slot's lease fetched it
+    /// (`null` for the static list) and how old it is. No slugs -- the list has
+    /// its own endpoint.
     pub async fn status(&self) -> Value {
-        let guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        self.apply_pending(&mut guard);
         let source = self.source_of(&guard);
+        let entry = guard.entry.as_ref();
         json!({
             "source": source.as_str(),
-            "models": if guard.models.is_empty() { FALLBACK_MODELS.len() } else { guard.models.len() },
+            "slot": entry.map(|entry| entry.slot.as_str()),
+            "models": entry.map_or(FALLBACK_MODELS.len(), |entry| entry.models.len()),
             "extra_models": self.extra.len(),
-            "fetched_seconds_ago": guard.fetched.map(|at| at.elapsed().as_secs()),
+            "fetched_seconds_ago": entry.map(|entry| entry.fetched.elapsed().as_secs()),
             "ttl_seconds": self.ttl.as_secs(),
             "last_error": guard.last_error,
         })
@@ -239,13 +403,14 @@ impl ModelCatalog {
 
     fn source_of(&self, state: &CatalogState) -> CatalogSource {
         if !self.discovery {
-            CatalogSource::Static
-        } else if state.models.is_empty() {
-            CatalogSource::Fallback
-        } else if state.fetched.is_some_and(|at| at.elapsed() < self.ttl) {
-            CatalogSource::Live
-        } else {
-            CatalogSource::Stale
+            return CatalogSource::Static;
+        }
+        match &state.entry {
+            None => CatalogSource::Fallback,
+            Some(entry) if !entry.superseded && entry.fetched.elapsed() < self.ttl => {
+                CatalogSource::Live
+            }
+            Some(_) => CatalogSource::Stale,
         }
     }
 
@@ -258,23 +423,32 @@ impl ModelCatalog {
         // The lock is held across the fetch on purpose: a burst of callers
         // becomes one upstream request, the rest read the answer.
         let mut guard = self.inner.lock().await;
+        self.apply_pending(&mut guard);
         if self.discovery {
-            let expired = guard.fetched.is_none_or(|at| at.elapsed() >= self.ttl);
+            let expired = guard
+                .entry
+                .as_ref()
+                .is_none_or(|entry| entry.superseded || entry.fetched.elapsed() >= self.ttl);
             let cooling = guard
                 .last_attempt
                 .is_some_and(|at| at.elapsed() < RETRY_COOLDOWN);
             if (expired || force) && !cooling {
                 guard.last_attempt = Some(Instant::now());
-                match fetch_catalog(router, client).await {
-                    Ok(models) => {
+                match fetch_catalog(router, client, &self.url).await {
+                    Ok((slot, models)) => {
                         info!(
-                            "model catalog refreshed: {} models ({} listed) for client {}",
+                            "model catalog refreshed through slot {}: {} models ({} listed) for client {}",
+                            slot,
                             models.len(),
                             models.iter().filter(|m| m.listed).count(),
                             codex_cli_version()
                         );
-                        guard.models = models;
-                        guard.fetched = Some(Instant::now());
+                        guard.entry = Some(CatalogEntry {
+                            models,
+                            slot,
+                            fetched: Instant::now(),
+                            superseded: false,
+                        });
                         guard.last_error = None;
                     }
                     Err(error) => {
@@ -285,15 +459,15 @@ impl ModelCatalog {
             }
         }
         let source = self.source_of(&guard);
-        let base: Vec<CatalogModel> = if guard.models.is_empty() {
-            fallback_models()
-        } else {
-            guard.models.clone()
+        let (base, slot) = match &guard.entry {
+            Some(entry) => (entry.models.clone(), Some(entry.slot.clone())),
+            None => (fallback_models(), None),
         };
         drop(guard);
         CatalogSnapshot {
             models: with_extras(base, &self.extra),
             source,
+            slot,
         }
     }
 }
@@ -379,15 +553,21 @@ pub fn clamp_effort(
     .or_else(|| Some(requested.to_string()))
 }
 
-async fn fetch_catalog(router: &AccountRouter, client: &Client) -> Result<Vec<CatalogModel>> {
+/// One backend answer, and the slot whose lease fetched it.
+async fn fetch_catalog(
+    router: &AccountRouter,
+    client: &Client,
+    url: &str,
+) -> Result<(String, Vec<CatalogModel>)> {
     // lease_any, as limits does: a parked active slot must not blind discovery
-    // while a healthy standby could answer.
+    // while a healthy standby could answer. The answer is then the standby's,
+    // which is why it is bound to the lease's slot, not to the active one.
     let account = router
         .lease_any()
         .await
         .context("no subscription available to read the model catalog")?;
     let response = client
-        .get(CODEX_MODELS_URL)
+        .get(url)
         .query(&[("client_version", codex_cli_version())])
         .bearer_auth(&account.access_token)
         .header("ChatGPT-Account-ID", &account.account_id)
@@ -417,7 +597,8 @@ async fn fetch_catalog(router: &AccountRouter, client: &Client) -> Result<Vec<Ca
         bail!("model catalog response is unexpectedly large");
     }
     let raw: Value = serde_json::from_slice(&body).context("invalid model catalog JSON")?;
-    parse_catalog(&raw)
+    let models = parse_catalog(&raw)?;
+    Ok((account.slot, models))
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -509,7 +690,8 @@ pub fn parse_catalog(raw: &Value) -> Result<Vec<CatalogModel>> {
 /// Build the OpenAI-shaped `/v1/models` document from a snapshot: listed models
 /// only, in priority order, with the backend's metadata beside the four
 /// standard fields. `meta.n_ctx_train` / `context_length` are the llama.cpp
-/// spellings that local-model client lanes read.
+/// spellings that local-model client lanes read. `relay_catalog` carries the
+/// snapshot's own provenance: its source and the slot that fetched it.
 pub fn model_list_from(snapshot: &CatalogSnapshot) -> ModelList {
     let created = chrono::Utc::now().timestamp();
     ModelList {
@@ -536,11 +718,16 @@ pub fn model_list_from(snapshot: &CatalogSnapshot) -> ModelList {
                 upgrade: m.upgrade.clone(),
             })
             .collect(),
+        relay_catalog: Some(CatalogProvenance {
+            source: snapshot.source.as_str().to_string(),
+            slot: snapshot.slot.clone(),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{model_for, staged_login, write_account, CatalogFixture};
     use super::*;
 
     fn fixture() -> Value {
@@ -605,6 +792,7 @@ mod tests {
         let snapshot = CatalogSnapshot {
             models: parse_catalog(&fixture()).unwrap(),
             source: CatalogSource::Live,
+            slot: Some("secondary".to_string()),
         };
         let list = model_list_from(&snapshot);
         assert_eq!(list.object, "list");
@@ -625,6 +813,12 @@ mod tests {
         assert!(value["data"][2].get("meta").is_none());
         assert!(value["data"][2].get("input_modalities").is_none());
         assert_eq!(value["data"][2]["upgrade"], "gpt-5.6-terra");
+        // Provenance rides beside the OpenAI fields, never inside an entry.
+        assert_eq!(
+            value["relay_catalog"],
+            json!({"source": "live", "slot": "secondary"})
+        );
+        assert!(value["data"][0].get("relay_catalog").is_none());
         // Hidden slugs are still findable for validation.
         assert!(snapshot.find("gpt-reserve").is_some());
         assert!(snapshot.find("gpt-5").is_none());
@@ -678,33 +872,506 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_off_reports_static_and_extras() {
-        let catalog =
-            ModelCatalog::with(Vec::new(), DEFAULT_TTL, false, parse_extra_models("gpt-x"));
+        let catalog = ModelCatalog::with(
+            DEFAULT_TTL,
+            false,
+            parse_extra_models("gpt-x"),
+            CODEX_MODELS_URL,
+        );
         let status = catalog.status().await;
         assert_eq!(status["source"], "static");
         assert_eq!(status["extra_models"], 1);
         assert_eq!(status["models"], FALLBACK_MODELS.len());
         assert!(status["fetched_seconds_ago"].is_null());
+        // The built-in list was produced by no subscription; say so explicitly.
+        assert!(status.get("slot").is_some_and(Value::is_null));
     }
 
     #[tokio::test]
     async fn a_preloaded_catalog_reports_live_until_the_ttl_passes() {
-        let catalog = ModelCatalog::with(
-            parse_catalog(&fixture()).unwrap(),
-            DEFAULT_TTL,
-            true,
-            Vec::new(),
-        );
-        assert_eq!(catalog.status().await["source"], "live");
-        let expired = ModelCatalog::with(
+        let catalog =
+            ModelCatalog::preloaded("primary", parse_catalog(&fixture()).unwrap(), DEFAULT_TTL);
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "live");
+        assert_eq!(status["slot"], "primary");
+        let expired = ModelCatalog::preloaded(
+            "primary",
             parse_catalog(&fixture()).unwrap(),
             Duration::ZERO,
-            true,
-            Vec::new(),
         );
-        assert_eq!(expired.status().await["source"], "stale");
-        let never = ModelCatalog::with(Vec::new(), DEFAULT_TTL, true, Vec::new());
-        assert_eq!(never.status().await["source"], "fallback");
+        let status = expired.status().await;
+        assert_eq!(status["source"], "stale");
+        assert_eq!(status["slot"], "primary", "age never rewrites provenance");
+        let never = ModelCatalog::with(DEFAULT_TTL, true, Vec::new(), CODEX_MODELS_URL);
+        let status = never.status().await;
+        assert_eq!(status["source"], "fallback");
+        assert!(status["slot"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_switch_before_any_read_and_switching_back_restores_live() {
+        let catalog =
+            ModelCatalog::preloaded("primary", parse_catalog(&fixture()).unwrap(), DEFAULT_TTL);
+        catalog.invalidate_for_switch("secondary");
+        // `/health` alone must stop calling primary's answer the live one.
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "stale");
+        assert_eq!(status["slot"], "primary");
+        // Back to the slot that fetched it before anything refreshed: it is that
+        // slot's live answer again.
+        catalog.invalidate_for_switch("primary");
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "live");
+        assert_eq!(status["slot"], "primary");
+        // A switch to the fetching slot never demotes its answer.
+        catalog.invalidate_for_switch("primary");
+        assert_eq!(catalog.status().await["source"], "live");
+    }
+
+    fn two_slot_router_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        write_account(root.path(), "secondary", "acct-secondary");
+        root
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_bound_to_the_slot_whose_lease_fetched_it() {
+        let backend = CatalogFixture::start().await;
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("primary"));
+        assert_eq!(snapshot.listed_slugs(), [model_for("acct-primary")]);
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "live");
+        assert_eq!(status["slot"], "primary");
+        assert_eq!(status["models"], 1);
+        let list = catalog.model_list(&router, &client).await;
+        assert_eq!(
+            list.relay_catalog,
+            Some(CatalogProvenance {
+                source: "live".to_string(),
+                slot: Some("primary".to_string()),
+            })
+        );
+        assert_eq!(backend.hits("acct-primary"), 1, "one fetch, then the cache");
+        assert_eq!(backend.hits("acct-secondary"), 0);
+    }
+
+    /// The trap a naive binding falls into: the active slot is unusable, so
+    /// `lease_any` parks it and the standby fetches. The answer is the standby's;
+    /// labelling it with the slot that was active when the fetch began would be
+    /// false, and leasing only the active slot would blind discovery instead.
+    #[tokio::test]
+    async fn a_failover_during_discovery_binds_the_answer_to_the_standby() {
+        let backend = CatalogFixture::start().await;
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        assert_eq!(router.active_slot().await, "primary");
+        std::fs::write(
+            root.path().join("accounts/primary/auth.json"),
+            b"not json at all",
+        )
+        .unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("secondary"));
+        assert_eq!(snapshot.listed_slugs(), [model_for("acct-secondary")]);
+        assert_eq!(catalog.status().await["slot"], "secondary");
+        assert_eq!(backend.hits("acct-secondary"), 1);
+        // lease_any's own failover is untouched: parked and switched, as before.
+        assert_eq!(router.active_slot().await, "secondary");
+        assert!(router
+            .describe()
+            .await
+            .iter()
+            .any(|view| view.slot == "primary" && view.cooldown_seconds_left > 0));
+    }
+
+    #[tokio::test]
+    async fn a_deliberate_switch_refreshes_an_answer_from_another_slot_at_once() {
+        let backend = CatalogFixture::start().await;
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+        assert_eq!(
+            catalog.snapshot(&router, &client).await.slot.as_deref(),
+            Some("primary")
+        );
+
+        router
+            .switch_to("secondary", |slot| catalog.invalidate_for_switch(slot))
+            .await
+            .unwrap();
+        // Well inside both the TTL and the retry cooldown of the first fetch.
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("secondary"));
+        assert_eq!(snapshot.listed_slugs(), [model_for("acct-secondary")]);
+        assert!(
+            catalog
+                .is_known(&model_for("acct-secondary"), &router, &client)
+                .await
+        );
+        assert_eq!(catalog.status().await["slot"], "secondary");
+        // One refresh per switch, not one per read.
+        catalog.snapshot(&router, &client).await;
+        assert_eq!(backend.hits("acct-secondary"), 1);
+        assert_eq!(backend.hits("acct-primary"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_the_slot_that_fetched_the_answer_keeps_it() {
+        let backend = CatalogFixture::start().await;
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+        catalog.snapshot(&router, &client).await;
+
+        router
+            .switch_to("primary", |slot| catalog.invalidate_for_switch(slot))
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("primary"));
+        assert_eq!(backend.hits("acct-primary"), 1, "nothing to refresh");
+        assert_eq!(backend.hits("acct-secondary"), 0);
+    }
+
+    /// Recovery is unchanged by the switch: the last good answer keeps serving
+    /// when the selected slot cannot read the catalog, honestly labelled, and
+    /// the retry cooldown still guards upstream afterwards.
+    #[tokio::test]
+    async fn a_failed_refresh_after_a_switch_keeps_the_last_answer_and_its_true_slot() {
+        let backend = CatalogFixture::start().await;
+        backend.fail("acct-secondary");
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+        catalog.snapshot(&router, &client).await;
+
+        router
+            .switch_to("secondary", |slot| catalog.invalidate_for_switch(slot))
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(
+            backend.hits("acct-secondary"),
+            1,
+            "the switch is acted on at once"
+        );
+        assert_eq!(snapshot.source, CatalogSource::Stale);
+        assert_eq!(snapshot.slot.as_deref(), Some("primary"));
+        assert_eq!(snapshot.listed_slugs(), [model_for("acct-primary")]);
+        let list = model_list_from(&snapshot);
+        assert_eq!(
+            serde_json::to_value(&list).unwrap()["relay_catalog"],
+            json!({"source": "stale", "slot": "primary"})
+        );
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "stale");
+        assert_eq!(status["slot"], "primary");
+        assert!(
+            status["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("500")),
+            "{status}"
+        );
+
+        // Neither a plain read nor an unknown slug's forced refresh gets past
+        // the cooldown the failed attempt armed.
+        catalog.snapshot(&router, &client).await;
+        assert!(!catalog.is_known("no-such-model", &router, &client).await);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+        assert_eq!(backend.hits("acct-primary"), 1);
+        assert_eq!(router.active_slot().await, "secondary");
+    }
+
+    /// The cold start: the very first discovery fails and arms the retry
+    /// cooldown while there is no answer for a switch to supersede. A
+    /// deliberate switch outranks that cooldown all the same: the next
+    /// `/v1/models` read asks the selected slot at once, whichever reader --
+    /// `/health` or the list itself -- applies the switch first.
+    #[tokio::test]
+    async fn a_switch_after_a_failed_cold_start_refreshes_at_once() {
+        for health_first in [false, true] {
+            let backend = CatalogFixture::start().await;
+            backend.fail("acct-primary");
+            let root = two_slot_router_root();
+            let router = AccountRouter::load(root.path()).await.unwrap();
+            let client = Client::new();
+            let catalog = backend.catalog();
+
+            let cold = catalog.snapshot(&router, &client).await;
+            assert_eq!(cold.source, CatalogSource::Fallback);
+            assert_eq!(cold.slot, None);
+            assert!(catalog.status().await["last_error"].is_string());
+            assert!(catalog.inner.lock().await.last_attempt.is_some());
+            // The failed attempt armed the cooldown: a plain read asks no one.
+            catalog.snapshot(&router, &client).await;
+            assert_eq!(backend.hits("acct-primary"), 1);
+            assert_eq!(backend.hits("acct-secondary"), 0);
+
+            router
+                .switch_to("secondary", |slot| catalog.invalidate_for_switch(slot))
+                .await
+                .unwrap();
+            if health_first {
+                // `/health` applies the switch but never fetches.
+                let status = catalog.status().await;
+                assert_eq!(status["source"], "fallback");
+                assert!(status["slot"].is_null());
+            }
+            // Well inside the cooldown of the failed cold-start attempt.
+            let list = catalog.model_list(&router, &client).await;
+            assert_eq!(
+                backend.hits("acct-secondary"),
+                1,
+                "the switch is acted on at once (health_first: {health_first})"
+            );
+            assert_eq!(
+                list.relay_catalog,
+                Some(CatalogProvenance {
+                    source: "live".to_string(),
+                    slot: Some("secondary".to_string()),
+                })
+            );
+            assert_eq!(list.data.len(), 1);
+            assert_eq!(list.data[0].id, model_for("acct-secondary"));
+            assert!(catalog.status().await["last_error"].is_null());
+
+            // One refresh per switch: the cooldown guards upstream again.
+            catalog.snapshot(&router, &client).await;
+            assert!(!catalog.is_known("no-such-model", &router, &client).await);
+            assert_eq!(backend.hits("acct-secondary"), 1);
+            assert_eq!(backend.hits("acct-primary"), 1);
+        }
+    }
+
+    /// The active primary signs out and the router moves to the secondary on
+    /// its own. Primary's answer goes with its credentials: `/health` stops
+    /// naming it before anything is read, and the next read asks the
+    /// secondary at once. When the secondary cannot answer, the built-in list
+    /// stands in -- the removed subscription's list is not kept as `stale`,
+    /// and its models are no longer accepted either way.
+    #[tokio::test]
+    async fn a_logout_forgets_the_answer_its_credentials_fetched() {
+        for secondary_answers in [true, false] {
+            let backend = CatalogFixture::start().await;
+            if !secondary_answers {
+                backend.fail("acct-secondary");
+            }
+            let root = two_slot_router_root();
+            let router = AccountRouter::load(root.path()).await.unwrap();
+            let client = Client::new();
+            let catalog = backend.catalog();
+            let before = catalog.snapshot(&router, &client).await;
+            assert_eq!(before.source, CatalogSource::Live);
+            assert_eq!(before.slot.as_deref(), Some("primary"));
+
+            router
+                .logout("primary", || {
+                    catalog.invalidate_for_credential_change("primary")
+                })
+                .await
+                .unwrap();
+            assert_eq!(router.active_slot().await, "secondary");
+            let status = catalog.status().await;
+            assert_eq!(status["source"], "fallback", "{status}");
+            assert!(status["slot"].is_null());
+            assert_eq!(status["models"], FALLBACK_MODELS.len());
+            assert!(status["fetched_seconds_ago"].is_null());
+
+            // Well inside both the TTL and the retry cooldown of the first fetch.
+            let list = catalog.model_list(&router, &client).await;
+            assert_eq!(
+                backend.hits("acct-secondary"),
+                1,
+                "the logout is acted on at once (secondary_answers: {secondary_answers})"
+            );
+            let ids: Vec<&str> = list.data.iter().map(|m| m.id.as_str()).collect();
+            if secondary_answers {
+                assert_eq!(
+                    list.relay_catalog,
+                    Some(CatalogProvenance {
+                        source: "live".to_string(),
+                        slot: Some("secondary".to_string()),
+                    })
+                );
+                assert_eq!(ids, [model_for("acct-secondary")]);
+            } else {
+                assert_eq!(
+                    list.relay_catalog,
+                    Some(CatalogProvenance {
+                        source: "fallback".to_string(),
+                        slot: None,
+                    })
+                );
+                assert_eq!(ids, FALLBACK_MODELS.to_vec());
+            }
+            assert!(
+                !catalog
+                    .is_known(&model_for("acct-primary"), &router, &client)
+                    .await
+            );
+            assert_eq!(backend.hits("acct-primary"), 1);
+            assert_eq!(backend.hits("acct-secondary"), 1);
+        }
+    }
+
+    /// A credential change elsewhere leaves an answer alone: signing the
+    /// standby in again costs the active slot's fresh answer nothing. And when
+    /// the slot a switch selected signs out, the router moves back to the slot
+    /// whose answer is still held; that answer is kept, and the next read
+    /// refreshes it through that slot at once rather than after the cooldown
+    /// the failed post-switch refresh armed.
+    #[tokio::test]
+    async fn a_credential_change_elsewhere_keeps_the_answer_and_a_move_back_refreshes_it() {
+        let backend = CatalogFixture::start().await;
+        let root = two_slot_router_root();
+        let router = AccountRouter::load(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+        catalog.snapshot(&router, &client).await;
+
+        catalog.invalidate_for_credential_change("secondary");
+        assert_eq!(catalog.status().await["source"], "live");
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("primary"));
+        assert_eq!(backend.hits("acct-primary"), 1, "nothing was due");
+        assert_eq!(backend.hits("acct-secondary"), 0);
+
+        backend.fail("acct-secondary");
+        router
+            .switch_to("secondary", |slot| catalog.invalidate_for_switch(slot))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.snapshot(&router, &client).await.source,
+            CatalogSource::Stale
+        );
+        assert_eq!(backend.hits("acct-secondary"), 1);
+
+        router
+            .logout("secondary", || {
+                catalog.invalidate_for_credential_change("secondary")
+            })
+            .await
+            .unwrap();
+        assert_eq!(router.active_slot().await, "primary");
+        let status = catalog.status().await;
+        assert_eq!(
+            status["source"], "stale",
+            "primary's answer is kept: {status}"
+        );
+        assert_eq!(status["slot"], "primary");
+        // Inside the cooldown the failed refresh through secondary armed.
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Live);
+        assert_eq!(snapshot.slot.as_deref(), Some("primary"));
+        assert_eq!(snapshot.listed_slugs(), [model_for("acct-primary")]);
+        assert_eq!(backend.hits("acct-primary"), 2);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+    }
+
+    /// A sign-in brings new credentials, so the next read asks at once: past
+    /// the cooldown a cold start with no subscription armed, and past the TTL
+    /// of the answer the slot's previous account fetched -- which is forgotten
+    /// rather than served as `stale` under a slot that now holds someone else.
+    #[tokio::test]
+    async fn a_sign_in_is_asked_at_once_and_retires_the_slot_previous_answer() {
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let router = AccountRouter::open(root.path()).await.unwrap();
+        let client = Client::new();
+        let catalog = backend.catalog();
+        let cold = catalog.snapshot(&router, &client).await;
+        assert_eq!(cold.source, CatalogSource::Fallback);
+        assert!(catalog.inner.lock().await.last_attempt.is_some());
+
+        router.stage_next_login(staged_login("primary", "acct-first"));
+        router
+            .login("primary", || {
+                catalog.invalidate_for_credential_change("primary")
+            })
+            .await
+            .unwrap();
+        let first = catalog.snapshot(&router, &client).await;
+        assert_eq!(first.source, CatalogSource::Live);
+        assert_eq!(first.slot.as_deref(), Some("primary"));
+        assert_eq!(first.listed_slugs(), [model_for("acct-first")]);
+
+        // The same slot signed in again, as another account, inside the TTL.
+        router.stage_next_login(staged_login("primary", "acct-second"));
+        router
+            .login("primary", || {
+                catalog.invalidate_for_credential_change("primary")
+            })
+            .await
+            .unwrap();
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "fallback", "{status}");
+        assert!(status["slot"].is_null());
+        let second = catalog.snapshot(&router, &client).await;
+        assert_eq!(second.source, CatalogSource::Live);
+        assert_eq!(second.slot.as_deref(), Some("primary"));
+        assert_eq!(second.listed_slugs(), [model_for("acct-second")]);
+        assert!(
+            !catalog
+                .is_known(&model_for("acct-first"), &router, &client)
+                .await
+        );
+        // One ask per sign-in: the cooldown guards upstream again.
+        assert_eq!(backend.hits("acct-first"), 1);
+        assert_eq!(backend.hits("acct-second"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_builtin_lists_name_no_slot() {
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let router = AccountRouter::open(root.path()).await.unwrap();
+        let client = Client::new();
+
+        let snapshot = ModelCatalog::static_only().snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Static);
+        assert_eq!(snapshot.slot, None);
+        let value = serde_json::to_value(model_list_from(&snapshot)).unwrap();
+        assert_eq!(
+            value["relay_catalog"],
+            json!({"source": "static", "slot": null})
+        );
+
+        // Discovery on, but no subscription to ask: the fallback, from no slot.
+        let catalog = backend.catalog();
+        let snapshot = catalog.snapshot(&router, &client).await;
+        assert_eq!(snapshot.source, CatalogSource::Fallback);
+        assert_eq!(snapshot.slot, None);
+        assert_eq!(snapshot.listed_slugs(), FALLBACK_MODELS.to_vec());
+        let status = catalog.status().await;
+        assert_eq!(status["source"], "fallback");
+        assert!(status["slot"].is_null());
+        assert!(status["last_error"].is_string());
+        // A switch recorded while nothing was fetched has nothing to demote.
+        catalog.invalidate_for_switch("secondary");
+        assert_eq!(catalog.status().await["source"], "fallback");
+        assert_eq!(
+            backend.hits("acct-primary") + backend.hits("acct-secondary"),
+            0
+        );
     }
 
     #[test]
@@ -768,5 +1435,138 @@ mod tests {
         assert_eq!(CatalogSource::Stale.as_str(), "stale");
         assert_eq!(CatalogSource::Fallback.as_str(), "fallback");
         assert_eq!(CatalogSource::Static.as_str(), "static");
+    }
+}
+
+/// A local stand-in for the backend catalog endpoint, shared by the catalog,
+/// HTTP and control tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use axum::{http::HeaderMap, http::StatusCode, response::IntoResponse, routing::get, Router};
+    use base64::Engine;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+
+    /// The one model the fixture offers `account_id`, so an answer names whose
+    /// credentials fetched it.
+    pub(crate) fn model_for(account_id: &str) -> String {
+        format!("model-of-{account_id}")
+    }
+
+    #[derive(Default)]
+    struct Ledger {
+        hits: BTreeMap<String, usize>,
+        failing: BTreeSet<String>,
+    }
+
+    pub(crate) struct CatalogFixture {
+        url: String,
+        ledger: Arc<std::sync::Mutex<Ledger>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CatalogFixture {
+        pub(crate) async fn start() -> Self {
+            let ledger = Arc::new(std::sync::Mutex::new(Ledger::default()));
+            let served = ledger.clone();
+            let app = Router::new().route(
+                "/codex/models",
+                get(move |headers: HeaderMap| {
+                    let ledger = served.clone();
+                    async move {
+                        let account = headers
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let failing = {
+                            let mut ledger = ledger.lock().unwrap();
+                            *ledger.hits.entry(account.clone()).or_default() += 1;
+                            ledger.failing.contains(&account)
+                        };
+                        if failing {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        axum::Json(json!({"models": [
+                            {"slug": model_for(&account), "visibility": "list", "priority": 1}
+                        ]}))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/codex/models", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            CatalogFixture { url, ledger, task }
+        }
+
+        /// A discovering catalog with the default TTL that reads this fixture.
+        pub(crate) fn catalog(&self) -> ModelCatalog {
+            ModelCatalog::with(DEFAULT_TTL, true, Vec::new(), &self.url)
+        }
+
+        /// Catalog requests that arrived with `account_id`'s credentials.
+        pub(crate) fn hits(&self, account_id: &str) -> usize {
+            self.ledger
+                .lock()
+                .unwrap()
+                .hits
+                .get(account_id)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// From now on `account_id` is answered with a 500.
+        pub(crate) fn fail(&self, account_id: &str) {
+            self.ledger
+                .lock()
+                .unwrap()
+                .failing
+                .insert(account_id.to_string());
+        }
+    }
+
+    impl Drop for CatalogFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// A synthetic ChatGPT profile in `slot`, the shape the router tests write.
+    pub(crate) fn write_account(root: &Path, slot: &str, account_id: &str) {
+        write_auth(&root.join("accounts").join(slot), slot, account_id);
+    }
+
+    /// What the browser sign-in leaves staged for `slot` as `account_id`, for
+    /// `AccountRouter::stage_next_login`.
+    pub(crate) fn staged_login(slot: &str, account_id: &str) -> tempfile::TempDir {
+        let staged = tempfile::tempdir().unwrap();
+        write_auth(staged.path(), slot, account_id);
+        staged
+    }
+
+    /// `home/auth.json` holding `account_id`'s synthetic credentials.
+    fn write_auth(home: &Path, slot: &str, account_id: &str) {
+        std::fs::create_dir_all(home).unwrap();
+        let claims = json!({
+            "email": format!("{slot}@example.test"),
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let auth = json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": format!("e30.{encoded}.c2ln"),
+                "access_token": format!("access-{slot}"),
+                "refresh_token": format!("refresh-{slot}"),
+                "account_id": account_id
+            },
+            "last_refresh": chrono::Utc::now().to_rfc3339()
+        });
+        std::fs::write(home.join("auth.json"), auth.to_string()).unwrap();
     }
 }

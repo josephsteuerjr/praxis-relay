@@ -292,7 +292,7 @@ impl Relay {
         *task = Some(tokio::spawn(async move {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
-                relay.state.accounts.login(&slot),
+                relay.state.login_account(&slot),
             )
             .await;
             let error = match result {
@@ -372,14 +372,14 @@ impl Relay {
                     vec![wanted()?]
                 };
                 for slot in slots {
-                    self.state.accounts.logout(slot).await?;
+                    self.state.logout_account(slot).await?;
                     self.state.limits.invalidate(slot).await;
                     self.event(format!("Signed out of {slot}")).await;
                 }
             }
             "switch" => {
                 let slot = wanted()?;
-                self.state.accounts.switch_to(slot).await?;
+                self.state.switch_account(slot).await?;
                 self.event(format!("Active subscription: {slot}")).await;
             }
             "limits" => {
@@ -415,6 +415,10 @@ mod tests {
     use super::*;
 
     async fn isolated(root: &Path, port: u16) -> Arc<Relay> {
+        isolated_with_catalog(root, port, ModelCatalog::from_env()).await
+    }
+
+    async fn isolated_with_catalog(root: &Path, port: u16, catalog: ModelCatalog) -> Arc<Relay> {
         let config = Arc::new(Config {
             codex_home: root.to_path_buf(),
             chatgpt_base_url: "https://invalid.example".into(),
@@ -432,7 +436,7 @@ mod tests {
                 accounts: AccountRouter::open(root).await.unwrap(),
                 client: reqwest::Client::new(),
                 limits: LimitsCache::default(),
-                catalog: ModelCatalog::from_env(),
+                catalog,
             },
             running: Mutex::new(None),
             login_task: Mutex::new(None),
@@ -591,6 +595,388 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn the_switch_control_refreshes_a_catalog_fetched_through_the_other_slot() {
+        use crate::core::catalog::test_support::{model_for, write_account, CatalogFixture};
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        write_account(root.path(), "secondary", "acct-secondary");
+        let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+
+        let before = relay.command("models", None, None).await.unwrap();
+        assert_eq!(before["source"], "live");
+        assert_eq!(before["models"], json!([model_for("acct-primary")]));
+
+        relay
+            .command("switch", Some("secondary"), None)
+            .await
+            .unwrap();
+        let after = relay.command("models", None, None).await.unwrap();
+        assert_eq!(after["source"], "live");
+        assert_eq!(after["models"], json!([model_for("acct-secondary")]));
+        assert_eq!(relay.state.catalog.status().await["slot"], "secondary");
+        assert_eq!(backend.hits("acct-primary"), 1);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> Value {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_logout_control_drops_the_signed_out_slot_catalog_from_health_and_models() {
+        use crate::core::catalog::test_support::{model_for, write_account, CatalogFixture};
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        write_account(root.path(), "secondary", "acct-secondary");
+        let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+        let app = app_router(relay.state.clone());
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "primary"})
+        );
+
+        relay
+            .command("logout", Some("primary"), None)
+            .await
+            .unwrap();
+        // The router moved to the remaining slot by itself, and `/health`,
+        // which never fetches, no longer names the signed-out slot's answer.
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["account_router"]["active_slot"], "secondary");
+        assert_eq!(health["model_catalog"]["source"], "fallback");
+        assert!(health["model_catalog"]["slot"].is_null());
+
+        // The very next read, well inside the TTL, is the secondary's answer.
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "secondary"})
+        );
+        assert_eq!(models["data"].as_array().unwrap().len(), 1);
+        assert_eq!(models["data"][0]["id"], model_for("acct-secondary"));
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["model_catalog"]["source"], "live");
+        assert_eq!(health["model_catalog"]["slot"], "secondary");
+        assert_eq!(backend.hits("acct-primary"), 1);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+    }
+
+    /// The shared `login` control, run to its end; how it ended.
+    async fn finish_login(relay: &Arc<Relay>, slot: &str) -> LoginState {
+        relay.command("login", Some(slot), None).await.unwrap();
+        let task = relay
+            .login_task
+            .lock()
+            .await
+            .take()
+            .expect("a sign-in task");
+        task.await.unwrap();
+        let login = relay.login_state.lock().await.clone();
+        assert!(!login.pending);
+        login
+    }
+
+    /// A sign-in through the shared `login` control, start to finish; the
+    /// router's staged-login seam stands in for the browser.
+    async fn sign_in(relay: &Arc<Relay>, slot: &str, account_id: &str) {
+        use crate::core::catalog::test_support::staged_login;
+        relay
+            .state
+            .accounts
+            .stage_next_login(staged_login(slot, account_id));
+        assert_eq!(finish_login(relay, slot).await.error, None);
+    }
+
+    /// A directory where `path` names a file: removing or replacing it fails.
+    fn occupy(path: &Path) {
+        let _ = fs::remove_file(path);
+        fs::create_dir_all(path.join("occupied")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_login_control_refreshes_the_catalog_after_a_cold_start_and_a_replacement() {
+        use crate::core::catalog::test_support::{model_for, CatalogFixture};
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+        // A first run: nobody to ask, and the failed attempt arms the cooldown.
+        let cold = relay.command("models", None, None).await.unwrap();
+        assert_eq!(cold["source"], "fallback");
+        assert!(relay.state.catalog.status().await["last_error"].is_string());
+
+        sign_in(&relay, "primary", "acct-first").await;
+        let first = relay.command("models", None, None).await.unwrap();
+        assert_eq!(first["source"], "live");
+        assert_eq!(first["models"], json!([model_for("acct-first")]));
+
+        // The same slot signed in again, as another account, inside the TTL.
+        sign_in(&relay, "primary", "acct-second").await;
+        let status = relay.state.catalog.status().await;
+        assert_eq!(status["source"], "fallback", "{status}");
+        assert!(status["slot"].is_null());
+        let second = relay.command("models", None, None).await.unwrap();
+        assert_eq!(second["source"], "live");
+        assert_eq!(second["models"], json!([model_for("acct-second")]));
+        assert_eq!(relay.state.catalog.status().await["slot"], "primary");
+        assert_eq!(backend.hits("acct-first"), 1);
+        assert_eq!(backend.hits("acct-second"), 1);
+    }
+
+    /// A sign-out that removes primary's credentials and only then fails --
+    /// its legacy cleanup or its state write refused -- has still removed
+    /// them: `/health` stops naming the answer they fetched, and the next
+    /// read, well inside the TTL, asks again rather than serving it.
+    #[tokio::test]
+    async fn a_logout_that_fails_after_removing_credentials_still_retires_their_catalog() {
+        use crate::core::catalog::test_support::{model_for, write_account, CatalogFixture};
+        for blocked in ["auth.json", "router-state.json"] {
+            let backend = CatalogFixture::start().await;
+            let root = tempfile::tempdir().unwrap();
+            write_account(root.path(), "primary", "acct-primary");
+            write_account(root.path(), "secondary", "acct-secondary");
+            let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+            let app = app_router(relay.state.clone());
+            let models = get_json(&app, "/v1/models").await;
+            assert_eq!(
+                models["relay_catalog"],
+                json!({"source": "live", "slot": "primary"})
+            );
+
+            // The legacy auth.json the cleanup removes, or the state file the
+            // router writes, cannot be: both steps come after primary's own
+            // auth.json is gone.
+            let blocker = root.path().join(blocked);
+            occupy(&blocker);
+            let error = relay
+                .command("logout", Some("primary"), None)
+                .await
+                .unwrap_err();
+            assert!(
+                !root.path().join("accounts/primary/auth.json").exists(),
+                "{blocked}: {error:#}"
+            );
+            let health = get_json(&app, "/health").await;
+            assert_eq!(
+                health["account_router"]["active_slot"], "primary",
+                "the router never got to move"
+            );
+            assert_eq!(
+                health["model_catalog"]["source"], "fallback",
+                "{blocked}: {error:#}"
+            );
+            assert!(health["model_catalog"]["slot"].is_null());
+
+            // Unblocked, the next read asks the slot that still has an account.
+            fs::remove_dir_all(&blocker).unwrap();
+            let models = get_json(&app, "/v1/models").await;
+            assert_eq!(
+                models["relay_catalog"],
+                json!({"source": "live", "slot": "secondary"}),
+                "{blocked}"
+            );
+            assert_eq!(models["data"][0]["id"], model_for("acct-secondary"));
+            assert_eq!(backend.hits("acct-primary"), 1);
+            assert_eq!(backend.hits("acct-secondary"), 1);
+        }
+    }
+
+    /// The sign-in side. A sign-in whose OAuth fails has touched no
+    /// credential, so the answer the slot's account fetched stays live and
+    /// costs nothing. A replacement whose state write fails after the install
+    /// has swapped the account all the same: the old account's answer is
+    /// retired at once, and the next read asks the new one.
+    #[tokio::test]
+    async fn a_failed_sign_in_retires_the_catalog_only_once_it_replaced_the_account() {
+        use crate::core::catalog::test_support::{model_for, staged_login, CatalogFixture};
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+        sign_in(&relay, "primary", "acct-first").await;
+        let first = relay.command("models", None, None).await.unwrap();
+        assert_eq!(first["source"], "live");
+        assert_eq!(first["models"], json!([model_for("acct-first")]));
+
+        relay
+            .state
+            .accounts
+            .fail_next_login(std::io::Error::other("the browser was closed"));
+        let login = finish_login(&relay, "primary").await;
+        assert!(
+            login
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("browser was closed")),
+            "{:?}",
+            login.error
+        );
+        let status = relay.state.catalog.status().await;
+        assert_eq!(status["source"], "live", "{status}");
+        assert_eq!(status["slot"], "primary");
+        let kept = relay.command("models", None, None).await.unwrap();
+        assert_eq!(kept["models"], json!([model_for("acct-first")]));
+        assert_eq!(backend.hits("acct-first"), 1, "nothing was due");
+
+        occupy(&root.path().join("router-state.json"));
+        relay
+            .state
+            .accounts
+            .stage_next_login(staged_login("primary", "acct-second"));
+        let login = finish_login(&relay, "primary").await;
+        assert!(
+            login
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("account router state")),
+            "{:?}",
+            login.error
+        );
+        let status = relay.state.catalog.status().await;
+        assert_eq!(status["source"], "fallback", "{status}");
+        assert!(status["slot"].is_null());
+        let second = relay.command("models", None, None).await.unwrap();
+        assert_eq!(second["source"], "live");
+        assert_eq!(second["models"], json!([model_for("acct-second")]));
+        assert_eq!(relay.state.catalog.status().await["slot"], "primary");
+        assert_eq!(backend.hits("acct-first"), 1);
+        assert_eq!(backend.hits("acct-second"), 1);
+    }
+
+    /// A replacement sign-in has installed its credentials and waits for the
+    /// router state, which a quota failover holds at its commit (the router's
+    /// commit gate pins that instant), when the user cancels. The sign-in
+    /// never finishes, yet the slot already holds the new account: the answer
+    /// the old one fetched must retire all the same, so neither `/health` nor
+    /// `/v1/models` goes on presenting it as the slot's list.
+    #[tokio::test]
+    async fn a_sign_in_cancelled_after_installing_credentials_still_retires_the_old_catalog() {
+        use crate::core::account_router::TestCommitGate;
+        use crate::core::catalog::test_support::{
+            model_for, staged_login, write_account, CatalogFixture,
+        };
+        let backend = CatalogFixture::start().await;
+        let root = tempfile::tempdir().unwrap();
+        write_account(root.path(), "primary", "acct-primary");
+        write_account(root.path(), "secondary", "acct-secondary");
+        let relay = isolated_with_catalog(root.path(), 0, backend.catalog()).await;
+        let app = app_router(relay.state.clone());
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "primary"})
+        );
+        assert_eq!(models["data"][0]["id"], model_for("acct-primary"));
+
+        // A quota failover reaches its commit and holds the router state there.
+        let accounts = relay.state.accounts.clone();
+        let exhausted = accounts.lease_active().await.unwrap();
+        let (gate, commit_reached, release_commit) = TestCommitGate::new();
+        accounts.gate_next_commit(gate);
+        let failover = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(accounts.switch_after_quota(&exhausted))
+                .map(|standby| standby.slot)
+        });
+        commit_reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the failover must reach its commit and hold the router state");
+
+        // The sign-in installs the replacement credentials, then waits for
+        // that state. `begin_login` and `cancel_login` are called directly:
+        // `command` would also read the router state for its status reply.
+        relay
+            .state
+            .accounts
+            .stage_next_login(staged_login("primary", "acct-replacement"));
+        relay.begin_login("primary").await.unwrap();
+        let auth_file = root.path().join("accounts/primary/auth.json");
+        let installed = || {
+            crate::login::lib::try_read_auth_json(&auth_file)
+                .ok()
+                .and_then(|auth| auth.tokens)
+                .and_then(|tokens| tokens.account_id)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while installed().as_deref() != Some("acct-replacement") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the sign-in must install the replacement credentials");
+        assert!(relay.login_state.lock().await.pending);
+
+        relay.cancel_login().await;
+        // Cut off past the install: the slot keeps the new credentials, and
+        // the sign-in task never got to report an outcome of its own.
+        assert_eq!(installed().as_deref(), Some("acct-replacement"));
+        let login = relay.login_state.lock().await.clone();
+        assert!(!login.pending);
+        assert_eq!(login.slot, None);
+        assert_eq!(login.error, None);
+        let events = relay.events.lock().await.clone();
+        assert!(
+            events.iter().all(|event| {
+                let message = event["message"].as_str().unwrap_or_default();
+                !message.starts_with("Signed in") && !message.starts_with("Sign-in failed")
+            }),
+            "{events:?}"
+        );
+        // The old account's answer is gone already, before anything is read.
+        let status = relay.state.catalog.status().await;
+        assert_eq!(status["source"], "fallback", "{status}");
+        assert!(status["slot"].is_null(), "{status}");
+
+        release_commit.send(()).unwrap();
+        assert_eq!(failover.join().unwrap().unwrap(), "secondary");
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["account_router"]["active_slot"], "secondary");
+        assert_eq!(health["model_catalog"]["source"], "fallback");
+        assert!(health["model_catalog"]["slot"].is_null());
+        // The next read asks at once, through the slot the failover moved to.
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "secondary"})
+        );
+        assert_eq!(models["data"].as_array().unwrap().len(), 1);
+        assert_eq!(models["data"][0]["id"], model_for("acct-secondary"));
+
+        // Back on primary, its list is the replacement account's.
+        relay
+            .command("switch", Some("primary"), None)
+            .await
+            .unwrap();
+        let models = get_json(&app, "/v1/models").await;
+        assert_eq!(
+            models["relay_catalog"],
+            json!({"source": "live", "slot": "primary"})
+        );
+        assert_eq!(models["data"].as_array().unwrap().len(), 1);
+        assert_eq!(models["data"][0]["id"], model_for("acct-replacement"));
+        let health = get_json(&app, "/health").await;
+        assert_eq!(health["model_catalog"]["source"], "live");
+        assert_eq!(health["model_catalog"]["slot"], "primary");
+        assert_eq!(backend.hits("acct-primary"), 1);
+        assert_eq!(backend.hits("acct-secondary"), 1);
+        assert_eq!(backend.hits("acct-replacement"), 1);
     }
 
     #[tokio::test]
