@@ -34,6 +34,12 @@ jobs:
             python3 tests/accept_unix.py target/release/praxis-relay-headless
             python3 packaging/bundle.py linux --out dist --binaries target/release --commit "${{ github.sha }}"
           '
+      - name: Return build-cache ownership to the host runner
+        if: always()
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/linux-cache" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/linux-cache"
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:

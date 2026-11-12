@@ -45,8 +45,9 @@ with tempfile.TemporaryDirectory(prefix='relay-rendered-') as temporary:
    check(True,'light WKWebView renders its actual API address, confirmed by native OCR')
    duplicate=subprocess.run([str(desktop)],env=env,stdout=log,stderr=log,timeout=20)
    check(duplicate.returncode==0 and process.poll() is None,'second launch preserves the original native instance')
-   # Vision can confuse Latin glyphs on the Intel runner. A fixture nonce stays unique.
-   marker = str(100000 + secrets.randbelow(900000))
+   # Avoid the most ambiguous small glyphs: 0/O, 1/I and 7/slash. Alternate
+   # Vision candidates still have to contain this exact random fixture nonce.
+   marker = ''.join(secrets.choice('2345689') for _ in range(6))
    label = 'QA ' + marker
    (args.out/'fixture.json').write_text(
        json.dumps({'port':port,'label':label,'ocr_marker':marker}), encoding='utf8')

@@ -2,7 +2,6 @@ name: macOS native ports
 on:
   push:
     branches: [main, 'codex/**']
-    paths-ignore: ['packaging/**', '.github/workflows/macos*.yml']
   workflow_dispatch:
 permissions:
   contents: read
