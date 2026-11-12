@@ -64,8 +64,11 @@ with tempfile.TemporaryDirectory(prefix='relay-native-') as temporary:
             check(process.wait(timeout=15)==0,'native Ctrl+Q quits the window and service')
         else:
             run('screencapture','-x',args.out/'native-light.png')
-            # Standard Quit AppleEvent requires no Accessibility automation grant.
-            run('osascript','-e',f'tell application id "{identifier}" to quit')
+            # Request native Quit for this process, rather than a possibly
+            # different LaunchServices registration with the same bundle id.
+            quitter=args.out/'quit-application'
+            run('swiftc',Path(__file__).resolve().parents[1]/'packaging/quit_mac.swift','-o',quitter)
+            run(quitter,process.pid)
             check(process.wait(timeout=15)==0,'native application Quit stops the window and service')
         check(not (auth/'control.json').exists(),'native exit removes the control capability')
         check((auth/'api-key.txt').read_text().strip()==key,'native exit preserves the client key')

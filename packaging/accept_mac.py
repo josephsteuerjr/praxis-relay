@@ -10,6 +10,8 @@ identifier=json.loads((Path(__file__).parent.parent/'desktop/tauri.conf.json').r
 desktop=args.app/'Contents/MacOS/praxis-relay-desktop';headless=args.app/'Contents/MacOS/praxis-relay-headless'
 ocr=args.out/'recognize'
 subprocess.run(['swiftc',str(Path(__file__).with_name('ocr.swift')),'-o',str(ocr)],check=True)
+quitter=args.out/'quit-application'
+subprocess.run(['swiftc',str(Path(__file__).with_name('quit_mac.swift')),'-o',str(quitter)],check=True)
 def run(*cmd,**kwargs):return subprocess.check_output(list(map(str,cmd)),encoding='utf-8',**kwargs).strip()
 def wait_for(function,timeout=40):
  until=time.monotonic()+timeout
@@ -56,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='relay-rendered-') as temporary:
    check(cli('status')['settings']['labels']['primary']==label,'configured account label matches the OCR fixture nonce')
    wait_for(lambda:rendered('native-dark.png',marker))
    check(True,'dark theme and changed account label reach the rendered WKWebView')
-   run('osascript','-e',f'tell application id "{identifier}" to quit')
+   run(quitter,process.pid)
    check(process.wait(timeout=15)==0,'native Quit exits the final bundle cleanly')
    check(not (auth/'control.json').exists(),'native Quit removes the running capability')
    check((auth/'api-key.txt').read_text().strip()==key,'native Quit preserves the persistent client key')
