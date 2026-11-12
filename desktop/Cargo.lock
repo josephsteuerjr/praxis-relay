@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-relay"
-version = "1.1.3"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-relay-desktop"
-version = "1.1.3"
+version = "1.2.0"
 dependencies = [
  "praxis-relay",
  "serde_json",

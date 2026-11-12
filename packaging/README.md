@@ -5,7 +5,8 @@ All packages contain the same shared Rust service and embedded Tauri frontend.
 does not cross-compile them or download executable dependencies.
 
 - Windows: portable ZIP, desktop and headless executables.
-- macOS: native `.app` and DMG, plus a separate headless archive. Universal
+- macOS: Intel x86_64, Apple Silicon arm64 and Universal `.app`/DMG packages,
+  each with a headless archive. Intel is built and exercised natively on Tahoe. Universal
   packaging combines separately built Intel and Apple Silicon binaries with
   `lipo`, checks their architectures, and signs the finished app ad hoc.
 - Linux x86_64: DEB and RPM install desktop/headless binaries, a desktop entry,
@@ -40,7 +41,8 @@ The system UCRT is documented by [Microsoft](https://learn.microsoft.com/en-us/c
 
 The desktop uses system WebKit: WKWebView on macOS and WebKitGTK 4.1 on Linux.
 DEB/RPM dependency metadata installs the GTK/WebKit/AppIndicator runtime.
-Python 3.10+ with SSL is needed only for browser sign-in, not serving requests.
+Python 3.10+ with SSL is needed only for browser sign-in. Native device-code
+sign-in and serving requests do not require Python.
 Finder launches probe Python.org and Homebrew installation locations directly.
 The headless program has no graphical runtime dependency; Linux additionally
 needs the system OpenSSL runtime and trusted CA certificates.

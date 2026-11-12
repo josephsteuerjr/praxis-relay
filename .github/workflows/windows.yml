@@ -26,7 +26,9 @@ jobs:
       - name: Offline OAuth and portable PE tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Shared Rust service tests
-        run: cargo test --locked -- --test-threads=1
+        run: |
+          cargo test --locked -- --test-threads=1
+          node --test tests/reasoning-options.test.mjs tests/device-login.test.mjs
       - name: Build headless
         run: cargo build --release --locked --bin praxis-relay-headless
       - name: Accept actual headless process

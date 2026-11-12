@@ -17,7 +17,7 @@ jobs:
         include:
           - runner: macos-15
             arch: arm64
-          - runner: macos-15-intel
+          - runner: macos-26-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 55
@@ -39,6 +39,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           cargo test --locked -- --test-threads=1
+          node --test tests/reasoning-options.test.mjs tests/device-login.test.mjs
       - name: Build native executables
         run: |
           cargo build --release --locked --bin praxis-relay-headless
@@ -56,6 +57,16 @@ jobs:
           codesign --force --deep --sign - qa/praxis-relay.app
       - name: Accept actual native desktop
         run: python3 tests/accept_desktop.py qa/praxis-relay.app/Contents/MacOS/praxis-relay-desktop qa/praxis-relay.app/Contents/MacOS/praxis-relay-headless --out qa/evidence
+      - name: Package and accept the native architecture
+        run: |
+          python3 packaging/bundle.py mac --arch ${{ matrix.arch }} --out dist-native --binaries target/release
+          python3 tests/accept_headless.py dist-native/praxis-relay.app/Contents/MacOS/praxis-relay-headless
+          python3 packaging/accept_mac.py dist-native/praxis-relay.app --out native-package-evidence
+          hdiutil verify dist-native/*.dmg
+          mkdir "$RUNNER_TEMP/relay-native-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/relay-native-mounted" dist-native/*.dmg
+          python3 packaging/accept_mac.py "$RUNNER_TEMP/relay-native-mounted/praxis-relay.app" --out native-mounted-evidence
+          hdiutil detach "$RUNNER_TEMP/relay-native-mounted"
       - uses: actions/cache/save@v6
         if: always() && steps.cache.outputs.cache-hit != 'true'
         with:
@@ -71,6 +82,12 @@ jobs:
             target/release/praxis-relay-desktop
             target/release/praxis-relay-headless
             qa/evidence
+            dist-native/*.zip
+            dist-native/*.dmg
+            dist-native/*.tar.gz
+            dist-native/MACOS-BUILD-PASSPORT.json
+            native-package-evidence
+            native-mounted-evidence
           retention-days: 7
   universal:
     needs: native

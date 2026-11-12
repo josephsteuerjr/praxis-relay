@@ -1,10 +1,10 @@
 # Praxis Relay
 
-Version 1.1.3 binds model discovery to the account that fetched it and uses
-vendor quota reset windows when parking exhausted subscriptions. It includes
-per-request Fast mode from 1.1.2 and Ouroboros 7.9.0 cache-hinted request support
-introduced in 1.1.1.
-Cached usage limits follow the authenticated subscription identity across slot replacement.
+Version 1.2.0 adds native device-code sign-in to desktop and headless, with
+no Python, browser on the relay host, or localhost callback required. The same
+safe account replacement, two slots, quota routing and Fast mode remain available.
+macOS downloads include separate Intel and Apple Silicon packages plus Universal.
+Intel builds receive native macOS Tahoe qualification.
 
 A local OpenAI-compatible API backed by your ChatGPT subscription. A native
 **Tauri desktop app** and a separate **headless executable** share one Rust
@@ -30,7 +30,7 @@ installed-package validation targets. A headless archive needs no display.
 ## Desktop
 
 Run `praxis-relay-desktop.exe`. The Russian interface provides two account slots,
-browser sign-in/cancellation, replacement sign-in, logout, deliberate switching,
+device-code and browser sign-in/cancellation, replacement sign-in, logout, deliberate switching,
 per-account quotas, API start/stop, port settings and session activity.
 Sign in and start the API, then copy the base URL into your client.
 
@@ -46,6 +46,7 @@ the window and strand the running program.
 ```text
 praxis-relay-headless serve --headless
 praxis-relay-headless status
+praxis-relay-headless login primary --device-auth
 praxis-relay-headless login primary
 praxis-relay-headless login secondary
 praxis-relay-headless switch secondary
@@ -72,13 +73,21 @@ For a Linux service, use a writable persistent directory for every command:
 RELAY_AUTH_DIR=/var/lib/praxis-relay ./praxis-relay-headless serve --headless
 ```
 
-OAuth requires a browser and a loopback callback on port 1455. A remote headless
-host needs that callback forwarded to the browser's computer. Serving requests
-requires neither a browser nor Python.
+Use `login [primary|secondary] --device-auth` for a remote or headless host.
+The terminal prints a verification link and one-time code; open that link on any
+device, sign in and enter the code. The command waits for completion; Ctrl+C
+cancels only its own pending login. The code expires after at most 15 minutes.
+The desktop offers **Войти по коду**, with copy-code and cancel controls.
+Enable device-code login in ChatGPT security settings or workspace permissions
+first. If unavailable, choose browser sign-in. No Codex CLI is required.
+
+Browser sign-in (`login` without the flag) uses Python and a loopback callback
+on port 1455; a remote host needs callback forwarding for that method. Device-code
+sign-in and serving requests require neither Python nor a local browser.
 
 ## Login and storage
 
-Python **3.10+** is needed only for login. Windows discovery probes `python.exe`,
+Python **3.10+** is needed only for browser login. Device-code login is native Rust. Windows discovery probes `python.exe`,
 `py -3`, then `python3.exe` and verifies a real interpreter with SSL. Microsoft
 Store aliases are rejected. `RELAY_PYTHON` is an explicit executable override;
 an invalid override is reported rather than silently ignored.

@@ -1,0 +1,45 @@
+name: Linux native packages
+on:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: relay-linux-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: linux-cache
+          key: relay-linux-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-linux-
+      - name: Frontend contracts
+        run: node --test tests/reasoning-options.test.mjs tests/device-login.test.mjs
+      - name: Build on Debian 12 for its supported glibc baseline
+        run: |
+          docker build -t relay-build -f packaging/Dockerfile.linux .
+          mkdir -p linux-cache/registry linux-cache/target dist
+          docker run --rm --cpus=4 --memory=6g -v "$PWD:/source" -v "$PWD/linux-cache/registry:/usr/local/cargo/registry" -v "$PWD/linux-cache/target:/source/target" -e CARGO_BUILD_JOBS=4 -e RELAY_CODEX_VERSION=0.166.0 relay-build bash -ec '
+            python3 -m unittest discover -s tests -p "test_*.py" -v
+            cargo test --locked -- --test-threads=1
+            cargo build --release --locked --bin praxis-relay-headless
+            cargo build --manifest-path desktop/Cargo.toml --release --locked --target-dir target
+            python3 tests/accept_headless.py target/release/praxis-relay-headless
+            python3 tests/accept_unix.py target/release/praxis-relay-headless
+            python3 packaging/bundle.py linux --out dist --binaries target/release --commit "${{ github.sha }}"
+          '
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: praxis-relay-linux-${{ github.sha }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+          retention-days: 14

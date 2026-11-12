@@ -131,7 +131,10 @@ def mac(args):
     # nested helper first so that signing the main app never sees unsigned code.
     for name in ('praxis-relay-headless','praxis-relay-desktop'):
         run('codesign','--force','--sign','-',contents/'MacOS'/name)
-    value=passport(contents/'Resources','universal-apple-darwin',args.commit)
+    arch=getattr(args,'arch','universal')
+    expected={'arm64','x86_64'} if arch=='universal' else {arch}
+    target='universal-apple-darwin' if arch=='universal' else ('aarch64' if arch=='arm64' else 'x86_64')+'-apple-darwin'
+    value=passport(contents/'Resources',target,args.commit)
     value['binaries']=[dict(path='Contents/MacOS/'+p.name,
                            architectures=run('lipo','-archs',p).split()) for p in sorted((contents/'MacOS').iterdir())]
     value['packaging_commit']=os.environ.get('GITHUB_SHA',args.commit)
@@ -146,21 +149,22 @@ def mac(args):
     external_passport.write_text(json.dumps(external,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
     for binary in (contents/'MacOS').iterdir():
         architectures=set(run('lipo','-archs',binary).split())
-        assert architectures=={'arm64','x86_64'},architectures
+        assert architectures==expected,architectures
         for line in run('otool','-L',binary).splitlines():
             if line.startswith('\t'):
                 library=line.strip().split(' (',1)[0]
                 assert library.startswith(('/usr/lib/','/System/Library/')),library
-    archive=out/f'praxis-relay-{VERSION}-macos-universal.zip'
+    archive=out/f'praxis-relay-{VERSION}-macos-{arch}.zip'
     run('ditto','-c','-k','--sequesterRsrc','--keepParent',app,archive)
     image=out/'dmg-root';image.mkdir(exist_ok=True)
     run('ditto',app,image/app.name)
     copy(external_passport,image/external_passport.name)
     link=image/'Applications'
     if not link.exists():link.symlink_to('/Applications')
-    (image/'READ-ME.txt').write_text('Drag praxis-relay.app to Applications.\nmacOS 13.3+; Intel and Apple Silicon.\nAd-hoc signed; not Apple notarized. First opening may require approval in Privacy & Security.\nAccounts remain in ~/Library/Application Support/praxis-relay.\n',encoding='utf-8')
-    run('hdiutil','create','-volname','praxis-relay '+VERSION,'-srcfolder',image,'-ov','-format','UDZO',out/f'praxis-relay-{VERSION}-macos-universal.dmg')
-    headless(contents/'MacOS/praxis-relay-headless',out,'macos-universal',args.commit)
+    machines={'universal':'Intel and Apple Silicon','arm64':'Apple Silicon','x86_64':'Intel'}[arch]
+    (image/'READ-ME.txt').write_text(f'Drag praxis-relay.app to Applications.\nmacOS 13.3+; {machines}.\nAd-hoc signed; not Apple notarized. First opening may require approval in Privacy & Security.\nAccounts remain in ~/Library/Application Support/praxis-relay.\n',encoding='utf-8')
+    run('hdiutil','create','-volname','praxis-relay '+VERSION,'-srcfolder',image,'-ov','-format','UDZO',out/f'praxis-relay-{VERSION}-macos-{arch}.dmg')
+    headless(contents/'MacOS/praxis-relay-headless',out,'macos-'+arch,args.commit)
 
 def windows(args):
     from windows_pe import require_portable_runtime
@@ -177,6 +181,7 @@ if __name__=='__main__':
     parser.add_argument('--binaries',type=Path,required=True)
     parser.add_argument('--commit',default=os.environ.get('GITHUB_SHA'))
     parser.add_argument('--format',choices=['deb','rpm','both'],default='both')
+    parser.add_argument('--arch',choices=['universal','arm64','x86_64'],default='universal',help='macOS package architecture; verified against both Mach-O executables')
     args=parser.parse_args()
     args.commit=args.commit or run('git','-C',ROOT,'rev-parse','HEAD')
     args.out=args.out.resolve();args.binaries=args.binaries.resolve()
