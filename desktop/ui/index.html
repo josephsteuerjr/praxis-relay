@@ -107,8 +107,13 @@
       <p id="tray-hint" class="muted" hidden>В этой среде нет области уведомлений. Окно сворачивается в панель задач; API продолжает работать.</p>
       <div id="login-banner" class="banner" hidden>
         <div>
-          <strong>Остался один шаг — вход в браузере</strong>
-          <p>Текущая сессия сохраняется до успешного входа.</p>
+          <strong id="login-title">Остался один шаг — вход в браузере</strong>
+          <p id="login-description">Текущая сессия сохраняется до успешного входа.</p>
+          <div id="device-instructions" hidden>
+            <p id="device-address"></p>
+            <div class="device-code-row"><code id="device-code"></code><button data-copy="device-code">Копировать код</button></div>
+            <p id="device-expiry"></p>
+          </div>
           <button id="login-link" class="link">Открыть страницу входа</button>
         </div>
         <button id="cancel-login">Отменить</button>

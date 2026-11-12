@@ -554,6 +554,22 @@ progress::-webkit-progress-value {
 .banner button {
   flex-shrink: 0;
 }
+.device-code-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0;
+}
+#device-code {
+  font-size: 1.55rem;
+  letter-spacing: 0.12em;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+#device-address {
+  overflow-wrap: anywhere;
+}
 #notice {
   padding: 14px 18px;
   border: 1px solid var(--err);

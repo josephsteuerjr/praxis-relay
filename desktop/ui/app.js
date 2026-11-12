@@ -1,4 +1,5 @@
 import { reasoningChoices } from "./reasoning-options.mjs";
+import { deviceLoginView } from "./device-login.mjs";
 
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -57,6 +58,12 @@ function problem(error) {
   let message =
     "Не удалось выполнить действие. Причина указана в подробностях.";
   if (/^[А-ЯЁ]/.test(raw)) message = raw;
+  else if (/Device-code login is unavailable/.test(raw))
+    message = "Включи вход по коду в настройках безопасности ChatGPT или разрешениях рабочего пространства. Также доступен вход через браузер.";
+  else if (/Device code expired/.test(raw))
+    message = "Срок действия кода истёк. Начни вход заново, чтобы получить новый.";
+  else if (/device.code.*(network|proxy)|request a device code/i.test(raw))
+    message = "Не удалось подключиться для входа по коду. Проверь соединение и прокси, затем повтори.";
   else if (/OpenAI usage endpoint returned (401|403)/.test(raw))
     message = "Сессия недействительна. Войди в эту подписку заново.";
   else if (/OpenAI usage request failed/.test(raw))
@@ -81,7 +88,7 @@ function problem(error) {
   else if (/Login timed out/.test(raw))
     message = "Время ожидания входа истекло. Начни заново.";
   else if (/login is already in progress/i.test(raw))
-    message = "Заверши текущий вход в браузере или нажми «Отменить».";
+    message = "Заверши текущий вход или нажми «Отменить».";
   return `<div>${escape(message)}</div>${message === raw ? "" : `<details class="error-details"><summary>Технические подробности</summary><pre>${escape(raw)}</pre></details>`}`;
 }
 function notice(message) {
@@ -237,7 +244,7 @@ function accountCard(a, detailed) {
     name = state.settings.labels[slot],
     button = (op, title, cls = "") =>
       `<button class="${cls}" data-op="${op}" data-slot="${slot}">${title}</button>`;
-  return `<article class="account card ${a.active ? "active" : ""}"><div class="account-top"><span class="avatar">${slot === "primary" ? "I" : "II"}</span><span class="account-name">${escape(name)}</span>${a.active ? '<span class="active-label">● Активна</span>' : ""}</div>${a.configured ? `<p class="email">${escape(a.email || "Аккаунт подключён")}</p><p class="account-caption">${escape(a.error || a.plan || "Подписка ChatGPT")}</p>` : '<p class="empty-account">Здесь может быть ещё один вход в ChatGPT.</p>'}<div class="account-actions">${!a.configured ? button("login", "Войти в ChatGPT", "primary") : a.active ? "" : button("switch", "Использовать", "primary")}${a.configured && detailed ? button("limits", "Проверить квоты") + button("login", "Сменить вход") + button("logout", "Выйти", "danger") : ""}</div>${detailed && a.configured ? `<div class="quota-container">${quotaPanel(slot)}</div>` : ""}</article>`;
+  return `<article class="account card ${a.active ? "active" : ""}"><div class="account-top"><span class="avatar">${slot === "primary" ? "I" : "II"}</span><span class="account-name">${escape(name)}</span>${a.active ? '<span class="active-label">● Активна</span>' : ""}</div>${a.configured ? `<p class="email">${escape(a.email || "Аккаунт подключён")}</p><p class="account-caption">${escape(a.error || a.plan || "Подписка ChatGPT")}</p>` : '<p class="empty-account">Здесь может быть ещё один вход в ChatGPT.</p>'}<div class="account-actions">${!a.configured ? button("login_device", "Войти по коду", "primary") + button("login", "Через браузер") : a.active ? "" : button("switch", "Использовать", "primary")}${a.configured && detailed ? button("limits", "Проверить квоты") + button("login_device", "Войти по коду") + button("login", "Сменить через браузер") + button("logout", "Выйти", "danger") : ""}</div>${detailed && a.configured ? `<div class="quota-container">${quotaPanel(slot)}</div>` : ""}</article>`;
 }
 function renderAccounts() {
   if (!state) return;
@@ -389,6 +396,13 @@ function render(next) {
   $("restart-banner").hidden = !state.restart_required;
   $("login-banner").hidden = !state.login.pending;
   $("login-link").hidden = !state.login_url;
+  const loginView = deviceLoginView(state);
+  $("login-title").textContent = loginView.title;
+  $("login-description").textContent = loginView.description;
+  $("device-instructions").hidden = !loginView.code;
+  $("device-code").textContent = loginView.code;
+  $("device-address").textContent = loginView.url;
+  $("device-expiry").textContent = loginView.expiry;
   if (previousPending && !state.login.pending && state.login.error)
     notice(state.login.error);
   syncSettings();
@@ -535,7 +549,8 @@ document.addEventListener("click", async (event) => {
   if (b.dataset.copy && state) {
     try {
       await navigator.clipboard.writeText(
-        b.dataset.copy === "key" ? state.api_key : state.base_url,
+        b.dataset.copy === "device-code" ? state.device_code?.user_code || "" :
+          b.dataset.copy === "key" ? state.api_key : state.base_url,
       );
       toast("Скопировано");
     } catch {
