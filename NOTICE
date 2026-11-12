@@ -17,6 +17,7 @@ The following files are derived from that project and have been modified:
                                   upstream only when RELAY_INSTRUCTIONS=codex
   src/login/lib.rs                ChatGPT sign-in and token refresh
   src/login/token_data.rs         auth.json token model
+  src/login/device_code.rs        native device-code authorization protocol
   src/login/login_with_chatgpt.py local callback server for the sign-in flow
   src/core/client.rs              Responses-API client (not built; retained
   src/core/model_provider_info.rs  for reference — these three files are not

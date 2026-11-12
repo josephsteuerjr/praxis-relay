@@ -101,6 +101,12 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             # Exercise the actual interpreter discovery/helper startup without
             # opening a browser or contacting the identity provider.
             original=(auth/"auth.json").read_bytes()
+            device = subprocess.run([str(binary), "login", "primary", "--device-auth"],
+                env=dict(env, RELAY_PYTHON="not-a-python-executable"), capture_output=True,
+                text=True, encoding="utf-8", timeout=20)
+            check(device.returncode != 0 and "device" in device.stderr.lower() and "Python" not in device.stderr,
+                  "device-code CLI reaches native auth through the running service without Python")
+            check((auth/"auth.json").read_bytes()==original,"failed native device sign-in preserves the old account")
             with socket.socket() as callback:
                 callback_free=callback.connect_ex(("127.0.0.1",1455))!=0
             if callback_free:
@@ -132,6 +138,11 @@ with tempfile.TemporaryDirectory(prefix="praxis-relay-accept-") as temporary:
             check(restarted["settings"]["labels"]["primary"]=="Work" and restarted["settings"]["appearance"]["scale"]==115 and not restarted["restart_required"],"appearance, account names and model defaults survive process restart and apply to the new API")
             command("stop")
             check(process.wait(timeout=10)==0,"restarted service exits cleanly")
+            device = subprocess.run([str(binary), "login", "--device-auth", "secondary"],
+                env=dict(env, RELAY_PYTHON="not-a-python-executable"), capture_output=True,
+                text=True, encoding="utf-8", timeout=20)
+            check(device.returncode != 0 and "device" in device.stderr.lower() and "Python" not in device.stderr,
+                  "offline native device-code CLI accepts the flag before its slot without Python")
         finally:
             if process.poll() is None:
                 try:command("cancel_login")

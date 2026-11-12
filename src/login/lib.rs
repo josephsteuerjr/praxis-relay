@@ -28,6 +28,29 @@ pub use crate::login::token_data::TokenData;
 const SOURCE_FOR_PYTHON_SERVER: &str = include_str!("./login_with_chatgpt.py");
 
 static LOGIN_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DEVICE_CODE: std::sync::Mutex<Option<super::device_code::DeviceCodePrompt>> =
+    std::sync::Mutex::new(None);
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginMethod {
+    #[default]
+    Browser,
+    DeviceCode,
+}
+
+pub fn device_code_prompt() -> Option<super::device_code::DeviceCodePrompt> {
+    DEVICE_CODE.lock().ok().and_then(|value| value.clone())
+}
+
+pub(super) fn publish_device_code(prompt: super::device_code::DeviceCodePrompt) {
+    if let Ok(mut url) = LOGIN_URL.lock() {
+        *url = Some(prompt.verification_url.clone());
+    }
+    if let Ok(mut value) = DEVICE_CODE.lock() {
+        *value = Some(prompt);
+    }
+}
 pub fn login_url() -> Option<String> {
     LOGIN_URL.lock().ok().and_then(|s| s.clone())
 }
@@ -35,9 +58,12 @@ pub fn clear_login_url() {
     if let Ok(mut url) = LOGIN_URL.lock() {
         *url = None;
     }
+    if let Ok(mut value) = DEVICE_CODE.lock() {
+        *value = None;
+    }
 }
 
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(super) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 
 #[derive(Clone, Debug, PartialEq, Copy)]
@@ -622,7 +648,7 @@ pub fn try_read_auth_json(auth_file: &Path) -> std::io::Result<AuthDotJson> {
 /// Если токены есть, а JWT не дали — пишем не «как получится», а ОТКАЗЫВАЕМСЯ.  Молчаливая
 /// запись неполного файла и есть та поломка, которую этот патч закрывает; пусть новое место
 /// вызова падает громко, а не портит auth.json.
-fn write_auth_json(
+pub(super) fn write_auth_json(
     auth_file: &Path,
     auth_dot_json: &AuthDotJson,
     id_token_jwt: Option<&str>,

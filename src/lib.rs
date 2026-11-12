@@ -86,10 +86,22 @@ impl AppState {
     /// start with no subscription to ask arms moments before the first
     /// sign-in. A sign-in that ends before the install, in OAuth say, has
     /// replaced nothing and invalidates nothing.
+    #[cfg(test)]
     async fn login_account(&self, slot: &str) -> anyhow::Result<()> {
-        self.accounts
-            .login(slot, || self.catalog.invalidate_for_credential_change(slot))
+        self.login_account_with_method(slot, crate::login::lib::LoginMethod::Browser)
             .await
+    }
+
+    async fn login_account_with_method(
+        &self,
+        slot: &str,
+        method: crate::login::lib::LoginMethod,
+    ) -> anyhow::Result<()> {
+        let changed = || self.catalog.invalidate_for_credential_change(slot);
+        match method {
+            crate::login::lib::LoginMethod::Browser => self.accounts.login(slot, changed).await,
+            crate::login::lib::LoginMethod::DeviceCode => self.accounts.login_with_method(slot, method, changed).await,
+        }
     }
 }
 
@@ -1437,7 +1449,9 @@ mod tests {
             catalog: ModelCatalog::static_only(),
             client: reqwest::Client::new(),
         };
-        state.accounts.stage_next_login(staged_login("primary", "acct-replacement"));
+        state
+            .accounts
+            .stage_next_login(staged_login("primary", "acct-replacement"));
         state.login_account("primary").await.unwrap();
 
         let app = app_router(state);

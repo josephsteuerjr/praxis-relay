@@ -7,6 +7,7 @@ use crate::core::{
     config::Config,
     limits::LimitsCache,
 };
+use crate::login::lib::LoginMethod;
 use crate::settings::Settings;
 use crate::{app_router, AppState};
 use anyhow::{anyhow, bail, Context, Result};
@@ -42,6 +43,8 @@ struct LoginState {
     pending: bool,
     slot: Option<String>,
     error: Option<String>,
+    method: Option<LoginMethod>,
+    id: Option<String>,
 }
 
 pub struct Relay {
@@ -251,6 +254,7 @@ impl Relay {
             "settings":settings,"restart_required":restart_required,"environment_overrides":overrides,
             "instructions_file":crate::core::config::custom_instructions().map(|_| crate::core::config::instructions_file_path()),
             "login":login,"login_url":if login.pending { crate::login::lib::login_url() } else { None },
+            "device_code":if login.pending && login.method == Some(LoginMethod::DeviceCode) { crate::login::lib::device_code_prompt() } else { None },
             "events":self.events.lock().await.clone()}),
         )
     }
@@ -274,31 +278,54 @@ impl Relay {
     }
 
     pub async fn begin_login(self: &Arc<Self>, slot: &str) -> Result<()> {
+        self.begin_login_with_method(slot, LoginMethod::Browser)
+            .await
+    }
+
+    async fn begin_login_with_method(
+        self: &Arc<Self>,
+        slot: &str,
+        method: LoginMethod,
+    ) -> Result<()> {
         self.state.accounts.auth_home(slot)?;
         let mut task = self.login_task.lock().await;
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
             bail!("A login is already in progress; finish or cancel it first");
         }
         crate::login::lib::clear_login_url();
+        let id = uuid::Uuid::new_v4().to_string();
         *self.login_state.lock().await = LoginState {
             pending: true,
             slot: Some(slot.to_string()),
             error: None,
+            method: Some(method),
+            id: Some(id.clone()),
         };
-        self.event(format!("Signing in to {slot}; finish in your browser"))
-            .await;
+        self.event(format!(
+            "Signing in to {slot} using {}",
+            if method == LoginMethod::DeviceCode {
+                "device code"
+            } else {
+                "browser"
+            }
+        ))
+        .await;
         let relay = self.clone();
         let slot = slot.to_string();
         *task = Some(tokio::spawn(async move {
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(300),
-                relay.state.login_account(&slot),
+                std::time::Duration::from_secs(if method == LoginMethod::DeviceCode {
+                    960
+                } else {
+                    300
+                }),
+                relay.state.login_account_with_method(&slot, method),
             )
             .await;
             let error = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => Some(format!("{e:#}")),
-                Err(_) => Some("Login timed out after five minutes".into()),
+                Err(_) => Some("Login timed out; start sign-in again".into()),
             };
             relay.state.limits.invalidate(&slot).await;
             relay
@@ -312,6 +339,8 @@ impl Relay {
                 pending: false,
                 slot: Some(slot),
                 error,
+                method: Some(method),
+                id: Some(id),
             };
             crate::login::lib::clear_login_url();
         }));
@@ -320,6 +349,19 @@ impl Relay {
 
     pub async fn cancel_login(&self) {
         if let Some(task) = self.login_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        *self.login_state.lock().await = LoginState::default();
+        crate::login::lib::clear_login_url();
+    }
+
+    async fn cancel_login_if_id(&self, id: &str) {
+        let mut task = self.login_task.lock().await;
+        if self.login_state.lock().await.id.as_deref() != Some(id) {
+            return;
+        }
+        if let Some(task) = task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -341,7 +383,12 @@ impl Relay {
             "start" => self.start().await?,
             "stop" => self.stop().await?,
             "login" => self.begin_login(wanted()?).await?,
+            "login_device" => {
+                self.begin_login_with_method(wanted()?, LoginMethod::DeviceCode)
+                    .await?
+            }
             "cancel_login" => self.cancel_login().await,
+            "cancel_login_id" => self.cancel_login_if_id(wanted()?).await,
             "open_login" => {
                 let url = crate::login::lib::login_url().context("No login is in progress")?;
                 if !url.starts_with("https://auth.openai.com/") {
@@ -414,6 +461,68 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn device_login_uses_the_shared_slot_install_and_clears_public_instructions() {
+        use crate::core::catalog::test_support::staged_login;
+        let root = tempfile::tempdir().unwrap();
+        let relay = isolated(root.path(), 0).await;
+        relay
+            .state
+            .accounts
+            .stage_next_login(staged_login("secondary", "device-account"));
+        relay
+            .command("login_device", Some("secondary"), None)
+            .await
+            .unwrap();
+        let task = relay.login_task.lock().await.take().unwrap();
+        task.await.unwrap();
+        let status = relay.status().await.unwrap();
+        assert_eq!(status["login"]["method"], "device_code");
+        assert_eq!(status["login"]["pending"], false);
+        assert!(status["login"]["error"].is_null());
+        assert!(status["device_code"].is_null());
+        assert!(status["login_url"].is_null());
+        let auth = crate::login::lib::try_read_auth_json(
+            &root.path().join("accounts/secondary/auth.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            auth.tokens.unwrap().account_id.as_deref(),
+            Some("device-account")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_cli_cancellation_cannot_cancel_a_new_signin() {
+        use crate::core::catalog::test_support::{staged_login, write_account};
+        let root = tempfile::tempdir().unwrap();
+        write_account(root.path(), "primary", "original-account");
+        let relay = isolated(root.path(), 0).await;
+        let lease = relay.state.accounts.hold_refresh_for_test("primary").await;
+        relay
+            .state
+            .accounts
+            .stage_next_login(staged_login("primary", "replacement-account"));
+        relay
+            .begin_login_with_method("primary", LoginMethod::DeviceCode)
+            .await
+            .unwrap();
+        let id = relay.login_state.lock().await.id.clone().unwrap();
+        tokio::task::yield_now().await;
+        relay.cancel_login_if_id("stale-id").await;
+        assert!(relay.login_state.lock().await.pending);
+        relay.cancel_login_if_id(&id).await;
+        assert!(!relay.login_state.lock().await.pending);
+        let auth =
+            crate::login::lib::try_read_auth_json(&root.path().join("accounts/primary/auth.json"))
+                .unwrap();
+        assert_eq!(
+            auth.tokens.unwrap().account_id.as_deref(),
+            Some("original-account")
+        );
+        drop(lease);
+    }
 
     async fn isolated(root: &Path, port: u16) -> Arc<Relay> {
         isolated_with_catalog(root, port, ModelCatalog::from_env()).await
@@ -1040,6 +1149,82 @@ async fn control_handler(
     }
 }
 
+async fn control_request(
+    address: &ControlAddress,
+    op: &str,
+    slot: Option<String>,
+    settings: Option<Value>,
+) -> Result<Value> {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/_relay/control", address.port))
+        .header("x-relay-control", &address.token)
+        .json(&Command {
+            op: op.into(),
+            slot,
+            port: None,
+            settings,
+        })
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await?;
+    if !status.is_success() {
+        bail!(
+            "{}",
+            value["error"].as_str().unwrap_or("Control command failed")
+        );
+    }
+    Ok(value)
+}
+
+async fn wait_device_login<F, Fut, C, CFut>(
+    mut value: Value,
+    mut status: F,
+    cancel: C,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Result<Value>>,
+{
+    let id = value["login"]["id"]
+        .as_str()
+        .context("Login did not start")?
+        .to_owned();
+    let mut shown = false;
+    loop {
+        if value["login"]["id"].as_str() != Some(&id) {
+            bail!("This sign-in was cancelled or replaced");
+        }
+        if !value["login"]["pending"].as_bool().unwrap_or(false) {
+            if let Some(error) = value["login"]["error"].as_str() {
+                bail!("{error}");
+            }
+            return Ok(());
+        }
+        if !shown {
+            if let (Some(url), Some(code)) = (
+                value["device_code"]["verification_url"].as_str(),
+                value["device_code"]["user_code"].as_str(),
+            ) {
+                eprintln!("Open {url} on any device and enter this one-time code:\n\n  {code}\n\nThe code expires in 15 minutes. Waiting for confirmation; Ctrl+C cancels.");
+                shown = true;
+            }
+        }
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                let _ = cancel().await;
+                bail!("Device-code sign-in cancelled");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+        value = status().await?;
+    }
+}
+
 pub async fn cli() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -1049,7 +1234,17 @@ pub async fn cli() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let action = args.first().map(String::as_str).unwrap_or("serve");
+    let mut action = args.first().map(String::as_str).unwrap_or("serve");
+    if action == "login" {
+        for arg in args.iter().skip(1) {
+            if !matches!(arg.as_str(), "primary" | "secondary" | "--device-auth") {
+                bail!("Use login [primary|secondary] [--device-auth]");
+            }
+        }
+        if args.iter().any(|arg| arg == "--device-auth") {
+            action = "login_device";
+        }
+    }
     if matches!(action, "version" | "--version" | "-V") {
         println!(
             "Praxis Relay {} (independent relay; Codex-compatible upstream protocol)",
@@ -1058,7 +1253,7 @@ pub async fn cli() -> Result<()> {
         return Ok(());
     }
     if matches!(action, "help" | "--help" | "-h") {
-        println!("Praxis Relay {}\nHeadless: serve [--headless]\nControls: status | login [primary|secondary] | cancel_login | logout primary|secondary|all | switch primary|secondary | limits primary|secondary | models | stop\nSettings: configure <patch.json> (works offline and against a running process)\nConfig: RELAY_AUTH_DIR, RELAY_PORT, RELAY_API_KEY, RELAY_PYTHON, RELAY_CODEX_VERSION\nNative desktop: praxis-relay-desktop",env!("CARGO_PKG_VERSION"));
+        println!("Praxis Relay {}\nHeadless: serve [--headless]\nControls: status | login [primary|secondary] [--device-auth] | cancel_login | logout primary|secondary|all | switch primary|secondary | limits primary|secondary | models | stop\nSettings: configure <patch.json> (works offline and against a running process)\nConfig: RELAY_AUTH_DIR, RELAY_PORT, RELAY_API_KEY, RELAY_PYTHON, RELAY_CODEX_VERSION\nNative desktop: praxis-relay-desktop",env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if !matches!(
@@ -1069,6 +1264,7 @@ pub async fn cli() -> Result<()> {
             | "--headless"
             | "status"
             | "login"
+            | "login_device"
             | "cancel_login"
             | "logout"
             | "switch"
@@ -1088,31 +1284,30 @@ pub async fn cli() -> Result<()> {
         None
     };
     let slot = args
-        .get(1)
-        .filter(|a| !a.starts_with('-'))
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
         .cloned()
-        .or_else(|| (action == "login").then(|| "primary".into()));
+        .or_else(|| matches!(action, "login" | "login_device").then(|| "primary".into()));
     if !serve {
         let root = crate::core::config::auth_root()?;
         if let Ok(bytes) = fs::read(descriptor(&root)) {
             let address: ControlAddress = serde_json::from_slice(&bytes)?;
-            let response = reqwest::Client::new()
-                .post(format!("http://127.0.0.1:{}/_relay/control", address.port))
-                .header("x-relay-control", address.token)
-                .json(&Command {
-                    op: action.into(),
-                    slot,
-                    port: None,
-                    settings,
-                })
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
+            let value = control_request(&address, action, slot.clone(), settings).await?;
+            if action == "login_device" {
+                let id = value["login"]["id"]
+                    .as_str()
+                    .context("Login did not start")?
+                    .to_owned();
+                wait_device_login(
+                    value,
+                    || control_request(&address, "status", None, None),
+                    || control_request(&address, "cancel_login_id", Some(id.clone()), None),
+                )
                 .await?;
-            let status = response.status();
-            let value: Value = response.json().await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            if !status.is_success() {
-                bail!("Control command failed");
+                println!("Signed in to {}", slot.as_deref().unwrap_or("primary"));
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
             }
             return Ok(());
         }
@@ -1133,7 +1328,22 @@ pub async fn cli() -> Result<()> {
         } else {
             relay.command(action, slot.as_deref(), None).await?
         };
-        if action == "login" {
+        if action == "login_device" {
+            let id = value["login"]["id"]
+                .as_str()
+                .context("Login did not start")?
+                .to_owned();
+            wait_device_login(
+                value,
+                || relay.status(),
+                || async {
+                    relay.cancel_login_if_id(&id).await;
+                    Ok(Value::Null)
+                },
+            )
+            .await?;
+            println!("Signed in to {}", slot.as_deref().unwrap_or("primary"));
+        } else if action == "login" {
             while relay.login_state.lock().await.pending {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -1152,7 +1362,9 @@ pub async fn cli() -> Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=term.recv()=>{} }
             return;
         }

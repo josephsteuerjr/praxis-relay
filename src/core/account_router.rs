@@ -676,6 +676,20 @@ impl AccountRouter {
     /// next await, where the call can be cancelled. A sign-in that fails or is
     /// cancelled before the install -- in OAuth, say -- never runs it.
     pub async fn login(&self, slot: &str, credentials_changed: impl FnOnce()) -> Result<()> {
+        self.login_with_method(
+            slot,
+            crate::login::lib::LoginMethod::Browser,
+            credentials_changed,
+        )
+        .await
+    }
+
+    pub async fn login_with_method(
+        &self,
+        slot: &str,
+        method: crate::login::lib::LoginMethod,
+        credentials_changed: impl FnOnce(),
+    ) -> Result<()> {
         let account = self
             .accounts
             .iter()
@@ -683,7 +697,7 @@ impl AccountRouter {
             .ok_or_else(|| anyhow!("unknown slot; use primary or secondary"))?;
         // OAuth is staged away from live credentials. A failed/cancelled login
         // leaves the previous account usable; only the final replace is locked.
-        let staged = self.stage_login(&account.auth_home).await?;
+        let staged = self.stage_login(&account.auth_home, method).await?;
         let _guard = account.refresh_lock.lock().await;
         crate::login::lib::install_staged_login(staged.path(), &account.auth_home)?;
         // The slot holds the new account from here on, whatever happens next.
@@ -698,7 +712,11 @@ impl AccountRouter {
 
     /// The browser OAuth helper's staged profile -- or, in tests, what
     /// `stage_next_login` or `fail_next_login` handed over.
-    async fn stage_login(&self, auth_home: &Path) -> std::io::Result<tempfile::TempDir> {
+    async fn stage_login(
+        &self,
+        auth_home: &Path,
+        method: crate::login::lib::LoginMethod,
+    ) -> std::io::Result<tempfile::TempDir> {
         #[cfg(test)]
         {
             let staged = self
@@ -710,7 +728,14 @@ impl AccountRouter {
                 return staged;
             }
         }
-        crate::login::lib::staged_chatgpt_login(auth_home).await
+        match method {
+            crate::login::lib::LoginMethod::Browser => {
+                crate::login::lib::staged_chatgpt_login(auth_home).await
+            }
+            crate::login::lib::LoginMethod::DeviceCode => {
+                crate::login::device_code::staged_login(auth_home).await
+            }
+        }
     }
 
     #[cfg(test)]
@@ -764,6 +789,11 @@ impl AccountRouter {
             access_token: tokens.access_token,
             account_id,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_refresh_for_test(&self, slot: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.accounts.iter().find(|account| account.slot == slot).unwrap().refresh_lock.lock().await
     }
 
     #[cfg(test)]
